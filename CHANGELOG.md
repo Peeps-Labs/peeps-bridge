@@ -24,5 +24,12 @@ First release: the runner for Peeps local discovery (PQA-2314).
   log keeps allowed origins only and drops credential headers, `filter` is
   refused, output is stripped of terminal control characters, redirects from
   Peeps are never followed, and Ctrl-C has a deadline and a watchdog.
+- Review round 2: the threat model for sign-in secrets is stated (accidents
+  and cheap routes, not a determined agent); fields are followed by element
+  instead of ref; values seen once stay scrubbed; a dialog no longer stalls a
+  call; clipboard keys, dragging out of a secret field and `fields[].selector`
+  are refused; the run rule is limited to console, network, URL, title and
+  field values; the network log is rendered by the runner; SIGHUP stops
+  cleanly.
 - `@peepsai/bridge/protocol`: the bridge protocol loop with no browser
   dependency, for `peeps-action` to share.

@@ -76,17 +76,18 @@ In plain words:
   the ones you add with `--allow-origin`. That keeps the agent, and any page it
   visits, away from the rest of your network: other local services, your
   intranet, cloud metadata endpoints.
-- **Sign-in secrets are kept from the agent.** A value named with
-  `--sign-in-secret` is read from your environment and kept in memory; the
-  agent only ever types the name. Before anything leaves your machine the
-  runner removes the value in its common encodings, any run of 6 or more of
-  its characters (fewer for a short secret), and the contents of every field
-  it was typed into and of every password field, for the rest of the session.
-  That covers a value the agent edits afterwards or a `maxlength` truncates.
-  It is not a guarantee: a page that transforms the value (hashes it, shows
-  every other character, splits it across elements) can still reveal it, and
-  the run rule also hides ordinary text that happens to share 6 characters
-  with a secret. Use test accounts, not real credentials.
+- **Sign-in secrets: protected from accidents, not from a determined
+  agent.** A value named with `--sign-in-secret` is read from your
+  environment and kept in memory; the agent types only the name. Before
+  anything leaves your machine the runner removes the value in its common
+  encodings everywhere; any run of 6 or more of its characters from console
+  and network output, URLs, titles and form fields; and the contents of every
+  field it was typed into and of every password field, for the rest of the
+  session. Copy, cut, paste and dragging out of such a field are refused.
+  That stops the value leaking by accident and closes the cheap ways to read
+  it. It does not stop an agent that sets out to read it: editing the field
+  key by key (inserting a character between each of the secret's) shows it a
+  piece at a time. **Use a test account, never real credentials.**
 - **Short-lived.** The grant works for one session, one person and one MCP
   connection, and only while the session lasts (at most 45 minutes). Peeps
   checks it on every request, so revoking the MCP connection, losing your

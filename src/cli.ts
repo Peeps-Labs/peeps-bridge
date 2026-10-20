@@ -45,11 +45,10 @@ Options:
   --allow-origin <origin>         ...except origins you add here, e.g. an SSO host
                                   https://auth.example.com. Repeatable.
   --sign-in-secret NAME=ENV_VAR   Let the agent type NAME; the browser fills in the value
-                                  of ENV_VAR from this shell. The agent never gets the
-                                  value, and the runner removes it (and the field's
-                                  contents) from what it sends. A page that shows it in
-                                  a changed form could still reveal it: see SECURITY.md.
-                                  Repeatable.
+                                  of ENV_VAR from this shell. The runner keeps the value
+                                  out of what it sends by accident, but an agent set on
+                                  reading it can (by editing the field key by key): use
+                                  a test account, never real credentials. Repeatable.
   --help, --version
 
 Environment:

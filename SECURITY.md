@@ -64,7 +64,9 @@ puts in a request.
 
 **Not sent:** screenshots or any other image (the screenshot tool is refused
 and image responses are turned off), files from your machine, your source
-code, environment variables, and the values of sign-in secrets.
+code, and environment variables other than the sign-in secrets you name. A
+sign-in secret is kept out of what is sent by accident, but an agent set on
+reading it can (see "Sign-in secrets").
 
 ## What Peeps can do on your machine
 
@@ -137,38 +139,52 @@ uses.
 
 ### Sign-in secrets
 
+**The threat model, in one line:** the runner protects a sign-in secret
+against accidental disclosure and closes every cheap deliberate route to it.
+It does not stop a determined, hostile agent from reading it. Use a test
+account, never real credentials.
+
 `--sign-in-secret NAME=ENV_VAR` reads `ENV_VAR` from your shell and gives the
 value to Playwright MCP in memory. The agent types `NAME`; Playwright fills in
-the value. So the agent is never given the value, and it is not in the call's
-arguments that Peeps stores.
+the value. The agent is not given the value, and it is not in the call
+arguments Peeps stores.
 
 The value is in the page, though, and pages show what is typed into them.
-Playwright replaces an exact match with `<secret>NAME</secret>`, by plain
+Playwright replaces an exact match with `<secret>NAME</secret>` by plain
 string replacement, which its own documentation calls "a convenience and not
-a security feature". The runner adds, on every result before it is posted and
-every line it prints:
+a security feature". On every result before it is posted, and every line it
+prints, the runner also removes:
 
 - the value in plain, URL-encoded, form-encoded, JSON-escaped (`\uXXXX` and
-  `\/` too), HTML-escaped and HTML numeric-entity forms;
-- any run of consecutive characters of the value of 6 or more (half the value
-  for one shorter than 12, never under 3), so a value the agent shortened with
-  Backspace or Delete, or that a `maxlength` truncated, is caught wherever it
-  appears;
-- the contents of every field the value was typed into, for the rest of the
-  session: hidden on that field's snapshot line whatever their length, and
-  removed from the rest of the result when 4 or more characters long;
-- the contents of every password field (`input[type=password]`) on every page
-  and frame, the same way, whether or not a secret went into it.
+  `\/` too), HTML-escaped and HTML numeric-entity forms, everywhere;
+- any run of 6 or more consecutive characters of the value (half the value
+  for one shorter than 12, never under 3) in console output, the network log,
+  printed lines, the Page URL and title, and the values of form fields. Not
+  in other page text, where it would hide ordinary words (a secret containing
+  `password` would hide the word "password");
+- the contents of every field the value was typed into, and of every password
+  field (`input[type=password]`) on every page and frame, and every value
+  those fields have held during the session: hidden on the field's snapshot
+  line whatever their length, and removed from the whole result when 4 or more
+  characters long. Fields are followed by element, not by Playwright's `ref`,
+  which restarts with every page;
+- a `<secret>…</secret>` marker gets no exemption unless it names a
+  configured secret.
 
-**What this does not cover.** An agent that is trying to read a secret, or a
-page that transforms it, can still get information out: a page that shows a
-hash of the value, every other character, its length, or splits it across
-elements; one or two characters left in a field after editing; text the page
-copies elsewhere and changes. Assume a determined agent or page could still
-recover a secret this way, and use a test account rather than real
-credentials. The run rule also hides harmless text that happens to
-share 6 characters with a secret (a secret containing `password` hides the
-word "password" on the page).
+The runner also refuses copy, cut and paste keys (in every spelling), dragging
+out of a secret or password field, choosing a form field by CSS selector
+instead of `ref` (which would escape the tracking), and typing a secret one
+character at a time (it is filled at once, so a page sees no prefixes).
+
+**What this does not cover.** An agent can edit a field key by key, for
+example inserting a character between each of the secret's, so that no run of
+6 is left and the field's contents are no longer what was typed; each
+snapshot then shows the secret a piece at a time. A page that transforms the
+value (hashes it, upper-cases it, reverses it, splits it across elements)
+can reveal it in that form. And `browser_wait_for` with a `text` answers yes
+or no to "is this text on the page", which an agent can use to test guesses
+about any page text. None of these happens by accident; all of them are
+available to an agent that sets out to read the value.
 
 ## What you see
 
