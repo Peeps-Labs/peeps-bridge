@@ -17,6 +17,8 @@ export interface ParsedLine {
   role: string | null;
   /** The accessible name, unescaped; null when there is none. */
   name: string | null;
+  /** The bracketed attributes, e.g. `level=1`, `active`, `ref=e3`. */
+  attrs: string[];
   ref: string | null;
   /** The value, unquoted; null when the line has none. */
   value: string | null;
@@ -26,8 +28,11 @@ export interface ParsedLine {
   opensChildren: boolean;
 }
 
-const KEY = /^([a-z]+)(?: "((?:[^"\\]|\\.)*)")?/;
-const REF = /\[ref=([a-z0-9]+)\]/;
+// Playwright's createKey: role, then the name as a JSON string (or, when it
+// looks like one, a /regex/ as written), then bracketed attributes.
+const KEY = /^([a-z]+)(?: ("(?:[^"\\]|\\.)*"|\/.*\/(?= \[|$)))?((?: \[[^\]]*\])*)$/;
+const ROLE_ONLY = /^([a-z]+)/;
+const ATTR = /\[([^\]]*)\]/g;
 
 export function parseLine(line: string): ParsedLine | null {
   let i = 0;
@@ -67,6 +72,7 @@ export function parseLine(line: string): ParsedLine | null {
   }
   const head = line.slice(0, i);
   const k = KEY.exec(key);
+  const attrs = k ? [...(k[3] ?? "").matchAll(ATTR)].map((a) => a[1]!) : [];
   let rawValue: string | null = null;
   let opensChildren = false;
   if (after.startsWith(": ")) rawValue = after.slice(2);
@@ -75,9 +81,10 @@ export function parseLine(line: string): ParsedLine | null {
   return {
     indent,
     head,
-    role: k?.[1] ?? null,
-    name: k?.[2] !== undefined ? unescapeName(k[2]) : null,
-    ref: REF.exec(key)?.[1] ?? null,
+    role: k?.[1] ?? (/^[a-z]+$/.test(key) ? (ROLE_ONLY.exec(key)?.[1] ?? null) : null),
+    name: k?.[2] !== undefined ? unquoteName(k[2]) : null,
+    attrs,
+    ref: attrs.find((a) => a.startsWith("ref="))?.slice(4) ?? null,
     value: rawValue === null ? null : unquoteValue(rawValue),
     rawValue,
     opensChildren,
@@ -94,7 +101,14 @@ export function roleAndName(line: ParsedLine | null): string | null {
   return line?.role && line.name ? `${line.role} "${line.name}"` : null;
 }
 
-const unescapeName = (name: string) => name.replace(/\\(.)/g, "$1");
+function unquoteName(name: string): string {
+  if (!name.startsWith('"')) return name;
+  try {
+    return JSON.parse(name) as string;
+  } catch {
+    return name.slice(1, -1);
+  }
+}
 
 function unquoteValue(raw: string): string {
   if (raw.length < 2 || !raw.startsWith('"') || !raw.endsWith('"')) return raw;
