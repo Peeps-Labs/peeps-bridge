@@ -144,9 +144,13 @@ export async function runBridgeSession(options: BridgeSessionOptions): Promise<S
           ...(body === undefined ? {} : { "content-type": "application/json" }),
         },
         body: body === undefined ? undefined : JSON.stringify(body),
+        // Never follow: a 307/308 would re-send the grant, the instance id
+        // and the body to wherever it points.
+        redirect: "manual",
         signal: AbortSignal.any([AbortSignal.timeout(requestTimeoutMs), ...(abortable && signal ? [signal] : [])]),
       });
       const text = await response.text();
+      if (response.status >= 300 && response.status < 400) return { status: response.status, body: { error: "redirect" } };
       if (response.status >= 500 || response.status === 429) return null;
       let parsed: unknown = null;
       try {
@@ -266,6 +270,9 @@ const REFUSAL_COPY: Record<string, (body: { message?: unknown; next?: unknown })
     "Another runner is already serving this session, and a session is served by one runner process only, " +
     "so a runner that was stopped or restarted cannot take it back. " +
     "Ask your coding agent to run start_local_discovery again for a fresh session and command.",
+  redirect: () =>
+    "Peeps answered with a redirect, which the runner never follows (it would send the grant to wherever it points). " +
+    "Check --server: use the exact https:// address start_local_discovery returned.",
   other_job: () => "Another CI job is already serving this session.",
   playwright_mcp_version: (body) =>
     [typeof body.message === "string" ? body.message : "This runner's @playwright/mcp version is not the one Peeps needs.", typeof body.next === "string" ? body.next : ""]

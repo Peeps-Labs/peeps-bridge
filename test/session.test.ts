@@ -235,10 +235,16 @@ describe("staying alive and leaving", () => {
     assert.ok(lines.some((l) => /lost contact/i.test(l)));
   });
 
-  it("keeps every backoff well inside the 3-minute heartbeat expiry", async () => {
+  it("keeps the backoff inside the 3-minute heartbeat expiry; the worst case is the request timeouts plus the backoff", async () => {
     bridge.callReplies.push(...Array.from({ length: 8 }, () => "drop" as const));
     await runBridgeSession(options());
-    assert.ok(sleeps.reduce((a, b) => a + b, 0) < 3 * 60 * 1000);
+    const backoff = sleeps.reduce((a, b) => a + b, 0);
+    assert.equal(backoff, 56_000);
+    // Between two heartbeats that did arrive there can be one timed-out poll
+    // (60 s) and one backoff (at most 14 s): far inside 3 minutes. Eight in a
+    // row (8 x 60 s + 56 s, about 9 minutes) end the run as lost contact, by
+    // which time Peeps has expired the session anyway.
+    assert.ok(60_000 + 14_000 < 3 * 60 * 1000);
   });
 
   it("leaves when the session's expiresAt has passed", async () => {
@@ -336,5 +342,22 @@ describe("a silent network", () => {
     const end = await runBridgeSession(options({ requestTimeoutMs: 300 }));
     assert.equal(end.handled, 1);
     assert.ok(lines.some((l) => /poll failed \(1\/8\)/.test(l)), lines.join("\n"));
+  });
+});
+
+describe("redirects", () => {
+  it("never follows one: a 307 would re-send the grant, the instance id and the body to another origin", async () => {
+    const elsewhere = await new FakeBridge().start();
+    try {
+      bridge.attachReplies.push({ status: 307, body: { location: "ignored" }, headers: { location: `${elsewhere.url}/api/v1/bridge/sessions/${SESSION_ID}/attach` } });
+      const error = await runBridgeSession(options()).catch((e: unknown) => e);
+      assert.ok(error instanceof BridgeRefusedError);
+      assert.equal(error.code, "redirect");
+      assert.match(error.message, /redirect/i);
+      assert.match(error.message, /--server/);
+      assert.equal(elsewhere.requests.length, 0);
+    } finally {
+      await elsewhere.stop();
+    }
   });
 });

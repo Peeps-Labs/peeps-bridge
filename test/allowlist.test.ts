@@ -64,6 +64,13 @@ describe("the tool allowlist", () => {
     });
   }
 
+  it("refuses filter on browser_network_requests: playwright-core compiles it with new RegExp on the runner's event loop (ReDoS)", () => {
+    assert.match(
+      refuseCall("browser_network_requests", { static: false, requestBody: false, requestHeaders: false, filter: "(a+)+$" }) ?? "",
+      /does not take filter/,
+    );
+  });
+
   it("refuses _meta, which playwright-core reads as a per-call working directory", () => {
     assert.match(refuseCall("browser_snapshot", { _meta: { cwd: "/" } }) ?? "", /does not take _meta/);
   });
@@ -114,6 +121,8 @@ describe("the catalogue against the installed @playwright/mcp", () => {
       assert.ok(upstream, `${tool.name} is not in the installed package`);
       const upstreamProperties = { ...upstream.inputSchema.properties };
       delete upstreamProperties.filename;
+      // `filter` is compiled with `new RegExp` on the runner's event loop: dropped.
+      if (tool.name === "browser_network_requests") delete upstreamProperties.filter;
       assert.deepEqual(
         JSON.parse(JSON.stringify(tool.inputSchema.properties)),
         JSON.parse(JSON.stringify(upstreamProperties)),

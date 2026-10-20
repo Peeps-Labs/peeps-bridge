@@ -4,7 +4,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
-import { RESULT_CAP_BYTES, shapeResult } from "../src/browser/results.js";
+import { RESULT_CAP_BYTES, filterNetworkLog, shapeResult } from "../src/browser/results.js";
 import { loadSecrets, makeScrubber } from "../src/browser/secrets.js";
 
 let workspace: string;
@@ -101,6 +101,45 @@ describe("shapeResult", () => {
   });
 });
 
+describe("filterNetworkLog", () => {
+  const allows = (url: string) => url.startsWith("http://localhost:3000/");
+  const log = [
+    "### Result",
+    "[GET] http://localhost:3000/api/me => [200] OK",
+    "  Request headers:",
+    "    accept: */*",
+    "    authorization: Bearer abc.def",
+    "    Cookie: sid=123",
+    "    proxy-authorization: Basic eA==",
+    "    set-cookie: x=1",
+    "[GET] http://127.0.0.1:9/secret => [FAILED] net::ERR_BLOCKED_BY_CLIENT",
+    "  Request headers:",
+    "    authorization: Bearer leak",
+    "[POST] http://localhost:3000/login => [302] Found",
+    "  Request body: a=1",
+    "### Page",
+    "- Page URL: http://localhost:3000/",
+  ].join("\n");
+
+  it("keeps only requests to allowed origins", () => {
+    const out = filterNetworkLog(log, allows);
+    assert.doesNotMatch(out, /127\.0\.0\.1|leak/);
+    assert.match(out, /\[POST\] http:\/\/localhost:3000\/login => \[302\] Found\n {2}Request body: a=1/);
+    assert.match(out, /### Page\n- Page URL: http:\/\/localhost:3000\//);
+    assert.match(out, /- 1 request to another origin was left out/);
+  });
+
+  it("redacts credential headers", () => {
+    const out = filterNetworkLog(log, allows);
+    assert.match(out, / {4}authorization: \[redacted by peeps-bridge\]/);
+    assert.match(out, / {4}Cookie: \[redacted by peeps-bridge\]/);
+    assert.match(out, / {4}proxy-authorization: \[redacted by peeps-bridge\]/);
+    assert.match(out, / {4}set-cookie: \[redacted by peeps-bridge\]/);
+    assert.match(out, / {4}accept: \*\/\*/);
+    assert.doesNotMatch(out, /abc\.def|sid=123/);
+  });
+});
+
 describe("secrets", () => {
   it("reads the named environment variables", () => {
     const secrets = loadSecrets(["SHOP_EMAIL=E2E_EMAIL", "SHOP_PASSWORD=E2E_PASSWORD"], { E2E_EMAIL: "shopper@example.test", E2E_PASSWORD: "Peeps-Test-2026!" });
@@ -127,6 +166,41 @@ describe("secrets", () => {
     assert.equal(scrub("a &quot;quoted&quot; &amp; &lt;b&gt; value"), "<secret>NOTE</secret>");
     assert.equal(scrub("note=a+%22quoted%22+%26+%3Cb%3E+value"), "note=<secret>NOTE</secret>");
     assert.equal(scrub("nothing here"), "nothing here");
+  });
+
+  it("scrubs HTML numeric entities, JSON \\u escapes, escaped slashes and HTML-escaped URL encodings", () => {
+    const scrub = makeScrubber({ PW: "a/b'c" });
+    const dec = [..."a/b'c"].map((c) => `&#${c.codePointAt(0)};`).join("");
+    const hex = [..."a/b'c"].map((c) => `&#x${c.codePointAt(0)!.toString(16)};`).join("");
+    const uni = [..."a/b'c"].map((c) => `\\u${c.codePointAt(0)!.toString(16).padStart(4, "0")}`).join("");
+    for (const form of [dec, hex, hex.toUpperCase().replace(/&#X/g, "&#x"), uni, "a\\/b'c", "a%2Fb&#39;c"]) {
+      assert.equal(scrub(`[${form}]`), "[<secret>PW</secret>]", form);
+    }
+  });
+
+  it("redacts any run of 6 or more consecutive characters of a secret, so a truncated or edited value does not leak", () => {
+    const scrub = makeScrubber({ PW: "Hunter2-Correct-Horse" });
+    assert.equal(scrub('textbox "Short": Hunter'), 'textbox "Short": <secret>PW</secret>');
+    assert.equal(scrub("Typed: Hunter2-Correct-Hors"), "Typed: <secret>PW</secret>");
+    assert.equal(scrub("tail: rrect-Horse!"), "tail: <secret>PW</secret>!");
+    assert.equal(scrub("Hunt is fine, so is Horse"), "Hunt is fine, so is Horse");
+  });
+
+  it("uses runs of half the secret for a short one, and never shorter than 3", () => {
+    const scrub = makeScrubber({ PIN: "48151623" });
+    assert.equal(scrub("code 4815 entered"), "code <secret>PIN</secret> entered");
+    assert.equal(scrub("481 is fine"), "481 is fine");
+    assert.equal(makeScrubber({ ABC: "xyz" })("xy xyz"), "xy <secret>ABC</secret>");
+  });
+
+  it("leaves Playwright's own markers intact when a secret's characters appear in them", () => {
+    const scrub = makeScrubber({ secret: "secretive-value" });
+    assert.equal(scrub("<secret>secret</secret> and secret"), "<secret>secret</secret> and <secret>secret</secret>");
+  });
+
+  it("scrubs extra values (a secret field's current contents) exactly, in their encodings", () => {
+    const scrub = makeScrubber({ PW: "Hunter2-Correct-Horse" });
+    assert.equal(scrub("value=Hun%21x", ["Hun!x"]), "value=<secret>a secret field</secret>");
   });
 
   it("scrubs the longer of two overlapping values first", () => {

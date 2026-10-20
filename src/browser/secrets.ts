@@ -1,18 +1,31 @@
 /**
- * Sign-in values stay on this machine (design §7.2). The person names them on
- * the command line as `--sign-in-secret NAME=ENV_VAR`; the runner reads each
- * variable and hands the values to Playwright MCP in memory as its `secrets`
- * map, so the agent types the NAME and Playwright fills in the value.
+ * Sign-in values (design §7.2). The person names them on the command line as
+ * `--sign-in-secret NAME=ENV_VAR`; the runner reads each variable and hands
+ * the values to Playwright MCP in memory as its `secrets` map, so the agent
+ * types the NAME and Playwright fills in the value.
  *
  * Playwright's own redaction is a plain string replace it calls "not a
- * security feature", and it misses the encoded forms a request log or a page
- * shows. So every result is also scrubbed here, of every form below, before
- * it is posted to Peeps or printed.
+ * security feature". It misses encoded forms, and anything the agent does to
+ * the field afterwards (a Backspace, a `maxlength` that truncated it) leaves a
+ * value that is no longer the whole secret. So every result is also scrubbed
+ * here, before it is posted or printed, of:
+ * - the value in each form below (plain, URL, form, JSON, HTML, entities);
+ * - any run of consecutive characters of a secret at least `runLength` long
+ *   (6, or half a short secret, never under 3), so a truncated or edited
+ *   value is caught wherever it appears;
+ * - extra values the caller passes: the current contents of fields that were
+ *   filled from a secret, and of password fields (`secret-fields.ts`).
+ *
+ * The run rule also redacts ordinary text that happens to share 6 characters
+ * with a secret. That is the price of catching partial values.
  */
 
 const SPEC = /^([A-Za-z_][A-Za-z0-9_]*)=([A-Za-z_][A-Za-z0-9_]*)$/;
 
 export type Secrets = Record<string, string>;
+
+/** How a secret field's contents are labelled when scrubbed. */
+export const FIELD_LABEL = "a secret field";
 
 export function loadSecrets(specs: string[], env: NodeJS.ProcessEnv): Secrets {
   const secrets: Secrets = {};
@@ -28,29 +41,111 @@ export function loadSecrets(specs: string[], env: NodeJS.ProcessEnv): Secrets {
   return secrets;
 }
 
-/** Every form a value is likely to appear in, longest first. */
-function variants(value: string): string[] {
-  const html = value.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;").replace(/'/g, "&#39;");
-  const forms = new Set([
-    value,
-    encodeURIComponent(value),
-    new URLSearchParams({ v: value }).toString().slice(2),
-    JSON.stringify(value).slice(1, -1),
-    html,
-    html.replace(/&#39;/g, "&#x27;"),
-  ]);
-  return [...forms].filter((form) => form.length > 0);
+/**
+ * The map in the order Playwright MCP should redact it: longest value first,
+ * so a secret that contains another is replaced whole, not as
+ * `<secret>SHORT</secret>-rest-of-the-longer-one`.
+ */
+export function longestFirst(secrets: Secrets): Secrets {
+  return Object.fromEntries(Object.entries(secrets).sort((a, b) => b[1].length - a[1].length));
 }
 
-/** A function that replaces every secret value with `<secret>NAME</secret>`. */
-export function makeScrubber(secrets: Secrets): (text: string) => string {
-  const pairs = Object.entries(secrets)
-    .flatMap(([name, value]) => variants(value).map((form) => [form, `<secret>${name}</secret>`] as const))
-    .sort((a, b) => b[0].length - a[0].length);
-  if (pairs.length === 0) return (text) => text;
-  return (text) => {
-    let out = text;
-    for (const [form, replacement] of pairs) out = out.split(form).join(replacement);
-    return out;
+const html = (text: string) => text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;").replace(/'/g, "&#39;");
+const codePoints = (text: string) => [...text].map((c) => c.codePointAt(0)!);
+
+/** Every form a value is likely to appear in. */
+function variants(value: string): string[] {
+  const uri = encodeURIComponent(value);
+  const form = new URLSearchParams({ v: value }).toString().slice(2);
+  const json = JSON.stringify(value).slice(1, -1);
+  const escaped = html(value);
+  const forms = new Set([
+    value,
+    uri,
+    form,
+    json,
+    json.replace(/\//g, "\\/"),
+    escaped,
+    escaped.replace(/&#39;/g, "&#x27;"),
+    html(uri),
+    html(form),
+    codePoints(value).map((c) => `&#${c};`).join(""),
+    codePoints(value).map((c) => `&#x${c.toString(16)};`).join(""),
+    codePoints(value).map((c) => `&#x${c.toString(16).toUpperCase()};`).join(""),
+    [...value].map((c) => `\\u${c.charCodeAt(0).toString(16).padStart(4, "0")}`).join(""),
+    [...value].map((c) => `\\u${c.charCodeAt(0).toString(16).padStart(4, "0").toUpperCase()}`).join(""),
+  ]);
+  return [...forms].filter((f) => f.length > 0);
+}
+
+/** The shortest run of a secret's characters that is redacted on its own. */
+export function runLength(secret: string): number | null {
+  if (secret.length <= 3) return null;
+  return Math.max(3, Math.min(6, Math.floor(secret.length / 2)));
+}
+
+// Placeholders are private-use characters only, so no secret's run can match
+// inside one.
+const token = (n: number) => `${[...n.toString(16)].map((d) => String.fromCharCode(0xe010 + parseInt(d, 16))).join("")}`;
+const TOKEN = /([-]+)/g;
+const MARKER = /<secret>[^<>\n]{1,100}<\/secret>/g;
+
+/**
+ * A function that replaces every secret value (and every extra value) with
+ * `<secret>NAME</secret>`.
+ */
+export function makeScrubber(secrets: Secrets): (text: string, extraValues?: readonly string[]) => string {
+  const entries = Object.entries(secrets);
+  const pairs = entries.flatMap(([name, value]) => variants(value).map((form) => [form, `<secret>${name}</secret>`] as const));
+  const runs = entries.flatMap(([name, value]) => {
+    const k = runLength(value);
+    if (k === null) return [];
+    const grams = new Set<string>();
+    for (let i = 0; i + k <= value.length; i++) grams.add(value.slice(i, i + k));
+    return [{ name, k, grams }];
+  });
+
+  return (text, extraValues = []) => {
+    const all = [...pairs, ...extraValues.flatMap((value) => variants(value).map((form) => [form, `<secret>${FIELD_LABEL}</secret>`] as const))].sort(
+      (a, b) => b[0].length - a[0].length,
+    );
+    if (all.length === 0) return text;
+    const saved: string[] = [];
+    const keep = (replacement: string) => {
+      saved.push(replacement);
+      return token(saved.length - 1);
+    };
+    // Markers already in the text (Playwright's own) are kept as they are.
+    let out = text.replace(MARKER, (marker) => keep(marker));
+    for (const [form, replacement] of all) {
+      if (out.includes(form)) out = out.split(form).join(keep(replacement));
+    }
+    for (const { name, k, grams } of runs) out = redactRuns(out, k, grams, () => keep(`<secret>${name}</secret>`));
+    return out.replace(TOKEN, (_t, digits: string) => saved[parseInt([...digits].map((d) => (d.charCodeAt(0) - 0xe010).toString(16)).join(""), 16)]!);
   };
+}
+
+/** Replace every maximal span covered by k-length runs found in `grams`. */
+function redactRuns(text: string, k: number, grams: Set<string>, replacement: () => string): string {
+  if (text.length < k) return text;
+  const covered = new Uint8Array(text.length);
+  let any = false;
+  for (let i = 0; i + k <= text.length; i++) {
+    if (grams.has(text.slice(i, i + k))) {
+      covered.fill(1, i, i + k);
+      any = true;
+    }
+  }
+  if (!any) return text;
+  let out = "";
+  for (let i = 0; i < text.length; ) {
+    if (!covered[i]) {
+      out += text[i];
+      i += 1;
+      continue;
+    }
+    while (i < text.length && covered[i]) i += 1;
+    out += replacement();
+  }
+  return out;
 }

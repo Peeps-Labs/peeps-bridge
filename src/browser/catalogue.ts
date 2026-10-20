@@ -11,8 +11,11 @@
  * `browser_close` (the runner owns the browser) and `browser_resize`. The
  * `filename` argument of `browser_snapshot`, `browser_console_messages` and
  * `browser_network_requests` is dropped: it writes a file under the working
- * directory. Any argument a schema does not declare is refused, which also
- * refuses `_meta` (playwright-core reads `_meta.cwd` as a per-call workspace).
+ * directory. `browser_network_requests`' `filter` is dropped too:
+ * playwright-core compiles it with `new RegExp` on this process's event loop,
+ * so a catastrophic pattern would freeze the runner (and its Ctrl-C). Any
+ * argument a schema does not declare is refused, which also refuses `_meta`
+ * (playwright-core reads `_meta.cwd` as a per-call workspace).
  *
  * A test compares these schemas with the installed package's own, so bumping
  * `@playwright/mcp` fails until this file and Peeps' copy are updated.
@@ -403,11 +406,6 @@ export const BROWSER_CATALOGUE: readonly BrowserToolDefinition[] =
             description:
               "Whether to include request headers. Defaults to false.",
             type: "boolean",
-          },
-          filter: {
-            description:
-              'Only return requests whose URL matches this regexp (e.g. "/api/.*user").',
-            type: "string",
           },
         },
         required: ["static", "requestBody", "requestHeaders"],

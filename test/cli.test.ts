@@ -5,7 +5,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
-import { main, parseCli, runnerInfo } from "../src/cli.js";
+import { main, parseCli, runnerInfo, safeIo } from "../src/cli.js";
 import { FakeBridge, SESSION_ID, call } from "./helpers/fake-bridge.js";
 import { startSites, type Sites } from "./helpers/sites.js";
 
@@ -57,7 +57,9 @@ describe("parseCli", () => {
     assert.throws(() => parseCli(["--server", "http://app.peepsai.com", ...base.slice(2)]), /--server must be https/);
     assert.throws(() => parseCli(["--server", "ftp://x", ...base.slice(2)]), /--server must be https/);
     assert.throws(() => parseCli([...base, "--bogus"]), /Unknown option/);
-    assert.throws(() => parseCli([...base, "extra"]), /Unexpected argument/);
+    assert.throws(() => parseCli([...base, "extra"]), /Unexpected argument at position 7/);
+    // A stray positional could be a grant pasted in the wrong place: never echoed.
+    assert.throws(() => parseCli([...base, "b1.1790000000000.c2lnbmF0dXJl"]), (e: Error) => !e.message.includes("b1.1790000000000"));
   });
 
   it("allows plain http only for a Peeps server on this machine", () => {
@@ -78,6 +80,40 @@ describe("runnerInfo", () => {
     assert.doesNotMatch(text, new RegExp(os.userInfo().username));
     assert.doesNotMatch(text, /[/\\]home[/\\]|[/\\]Users[/\\]|[A-Z]:\\/);
     assert.deepEqual(Object.keys(info).sort(), ["arch", "bridge", "node", "os", "playwrightCore", "playwrightMcp"]);
+  });
+});
+
+describe("terminal safety", () => {
+  it("strips control characters from every printed line, out and err", async () => {
+    const t = io();
+    const safe = safeIo(t.io);
+    safe.out("click '\x1b]52;c;ZXZpbA==\x07Place order' \x1b[2K\rfake line\x9b31m\x7f");
+    safe.err("refused \x1b[31mred\x1b[0m\u202edesrever");
+    assert.deepEqual(t.out, ["click ']52;c;ZXZpbA==Place order' [2Kfake line31m"]);
+    assert.deepEqual(t.err, ["refused [31mred[0mdesrever"]);
+  });
+
+  it("keeps newlines and tabs, which help and preflight messages use", () => {
+    const t = io();
+    safeIo(t.io).out("a\n\tb");
+    assert.deepEqual(t.out, ["a\n\tb"]);
+  });
+
+  it("covers what main prints from the server, such as a refusal's message", async () => {
+    const bridge = await new FakeBridge().start();
+    try {
+      bridge.attachReplies.push({ status: 409, body: { error: "playwright_mcp_version", message: "bad \x1b]52;c;cm0gLXJmIH4=\x07version", next: "\x1b[2K\rrun this" } });
+      const t = io();
+      const code = await main(["--server", bridge.url, "--session", SESSION_ID, "--target-url", "http://localhost:1/"], { PEEPS_RUNNER_GRANT: GRANT }, t.io, {
+        preflight: () => ({ ok: true }),
+      });
+      assert.equal(code, 1);
+      // eslint-disable-next-line no-control-regex -- asserting none are left
+      assert.doesNotMatch(t.err.join("\n") + t.out.join("\n"), /[\x00-\x08\x0b-\x1f\x7f-\x9f]/);
+      assert.match(t.err.join("\n"), /bad \]52;c;cm0gLXJmIH4=version/);
+    } finally {
+      await bridge.stop();
+    }
   });
 });
 

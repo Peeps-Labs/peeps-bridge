@@ -70,7 +70,8 @@ export function parseCli(argv: string[]): Cli {
     parsed = parseArgs({
       args: argv,
       strict: true,
-      allowPositionals: false,
+      allowPositionals: true,
+      tokens: true,
       options: {
         server: { type: "string" },
         session: { type: "string" },
@@ -83,10 +84,12 @@ export function parseCli(argv: string[]): Cli {
     });
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
-    if (/unexpected argument/i.test(message)) throw new Error(`Unexpected argument. ${message.split(". ")[0]}. See --help.`);
     throw new Error(`${message.replace(/^Unknown option/i, "Unknown option")} See --help.`);
   }
-  const { values } = parsed;
+  const { values, tokens } = parsed;
+  const positional = tokens.find((token) => token.kind === "positional");
+  // Never echo it: a stray positional may be a grant pasted in the wrong place.
+  if (positional) throw new Error(`Unexpected argument at position ${positional.index + 1}. See --help.`);
   if (values.help) return { kind: "help" };
   if (values.version) return { kind: "version" };
   if (!values.server) throw new Error("--server is required. See --help.");
@@ -130,6 +133,23 @@ export interface Io {
   err(line: string): void;
 }
 
+/**
+ * Control characters stripped from every printed line: C0 (but newline and
+ * tab), DEL, C1, and the bidirectional overrides. Much of what the runner
+ * prints comes from Peeps or from pages (element names, URLs, refusal
+ * messages), and a terminal obeys escape sequences: OSC 52 writes the
+ * clipboard, CSI moves the cursor and rewrites lines.
+ */
+// eslint-disable-next-line no-control-regex -- matching control characters is the point
+const UNSAFE_FOR_TERMINAL = /[\u0000-\u0008\u000b-\u001f\u007f-\u009f\u202a-\u202e\u2066-\u2069]/g;
+
+export function safeIo(io: Io): Io {
+  return {
+    out: (line) => io.out(line.replace(UNSAFE_FOR_TERMINAL, "")),
+    err: (line) => io.err(line.replace(UNSAFE_FOR_TERMINAL, "")),
+  };
+}
+
 export interface MainDeps {
   preflight?: () => Preflight;
   tmpRoot?: string;
@@ -141,7 +161,8 @@ export interface MainDeps {
 }
 
 /** Run the CLI; answers the exit code. */
-export async function main(argv: string[], env: NodeJS.ProcessEnv, io: Io, deps: MainDeps = {}): Promise<number> {
+export async function main(argv: string[], env: NodeJS.ProcessEnv, rawIo: Io, deps: MainDeps = {}): Promise<number> {
+  const io = safeIo(rawIo);
   let cli: Cli;
   let policy: OriginPolicy;
   let secrets: Record<string, string>;

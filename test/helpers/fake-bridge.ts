@@ -8,7 +8,7 @@ import http from "node:http";
 import type { AddressInfo } from "node:net";
 
 export type Reply =
-  | { status: number; body?: unknown; delayMs?: number }
+  | { status: number; body?: unknown; delayMs?: number; headers?: Record<string, string> }
   /** Close the connection without an answer: a transport error. */
   | "drop";
 
@@ -63,10 +63,10 @@ export class FakeBridge {
             return;
           }
           if (reply!.body === undefined) {
-            res.writeHead(reply!.status).end();
+            res.writeHead(reply!.status, reply!.headers).end();
             return;
           }
-          res.writeHead(reply!.status, { "content-type": "application/json" }).end(JSON.stringify(reply!.body));
+          res.writeHead(reply!.status, { "content-type": "application/json", ...reply!.headers }).end(JSON.stringify(reply!.body));
         };
         if (reply !== "drop" && reply.delayMs) setTimeout(send, reply.delayMs);
         else send();
