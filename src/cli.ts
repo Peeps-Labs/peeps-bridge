@@ -19,7 +19,7 @@ import { startBrowserHost, type BrowserHost, type BrowserHostOptions } from "./b
 import { OriginPolicy } from "./browser/origin-policy.js";
 import { chromiumPreflight, PLAYWRIGHT_CORE_VERSION, type Preflight } from "./browser/preflight.js";
 import { loadSecrets } from "./browser/secrets.js";
-import { BridgeRefusedError, runBridgeSession, type SessionEnd } from "./protocol/index.js";
+import { BridgeRefusedError, runBridgeSession } from "./protocol/index.js";
 import { createCallHandler } from "./runner.js";
 
 const require = createRequire(import.meta.url);
@@ -140,13 +140,6 @@ export interface MainDeps {
   sleep?: (ms: number) => Promise<void>;
 }
 
-const END_COPY: Record<SessionEnd["reason"], string> = {
-  session_over: "Peeps ended the session.",
-  expired: "The session's time is up.",
-  lost_contact: "Lost contact with Peeps.",
-  stopped: "stopped.",
-};
-
 /** Run the CLI; answers the exit code. */
 export async function main(argv: string[], env: NodeJS.ProcessEnv, io: Io, deps: MainDeps = {}): Promise<number> {
   let cli: Cli;
@@ -202,7 +195,8 @@ export async function main(argv: string[], env: NodeJS.ProcessEnv, io: Io, deps:
       ...(deps.signal ? { signal: deps.signal } : {}),
       ...(deps.sleep ? { sleep: deps.sleep } : {}),
     });
-    print(`${END_COPY[end.reason]} Served ${end.handled} call(s).`);
+    // The protocol has already said why it ended, except for a stop.
+    if (end.reason === "stopped") print(`stopped after ${end.handled} call(s)`);
     return end.reason === "lost_contact" ? 1 : 0;
   } catch (error) {
     if (error instanceof BridgeRefusedError) {
