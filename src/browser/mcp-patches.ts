@@ -6,6 +6,7 @@
  * - Downloads: `acceptDownloads: false` still emits the event, and the tab's
  *   unawaited `download.saveAs()` then rejects, an unhandled rejection that
  *   kills the process. The tab now cancels it and tells the session.
+ * - File choosers: cancelled instead of leaving the tab in a modal state.
  * - The MCP Context: captured when its backend initialises, so the runner
  *   knows the active tab and whether a dialog (a modal state) is open.
  * - `browser_network_requests`: rendered here instead of by playwright-core,
@@ -46,6 +47,7 @@ interface McpResponse {
 export interface SessionHooks {
   allowsUrl(url: string): boolean;
   onDownloadRefused(name: string): void;
+  onUploadRefused(): void;
 }
 
 const sessions = new WeakMap<BrowserContext, SessionHooks>();
@@ -88,7 +90,22 @@ function applyPatches(): void {
   const initialize = exports.BrowserBackend.prototype.initialize as (this: { browserContext: BrowserContext; _context: McpContext }, ...args: unknown[]) => Promise<void>;
   exports.BrowserBackend.prototype.initialize = async function (this: { browserContext: BrowserContext; _context: McpContext }, ...args: unknown[]) {
     await initialize.apply(this, args);
+    // Fail loudly: without the context the runner cannot tell the active tab
+    // or an open dialog, and secret-field tracking would quietly weaken.
+    if (typeof this._context?.currentTab !== "function" || typeof this._context?.tabs !== "function") {
+      throw new Error("peeps-bridge: @playwright/mcp's browser backend has changed shape (no context with currentTab and tabs)");
+    }
     contexts.set(this.browserContext, this._context);
+  };
+
+  // Uploads are refused (no browser_file_upload), but a page's file chooser
+  // would leave the tab in a modal state that only that tool clears. Cancel
+  // the chooser instead, and say so in the next result.
+  const setModalState = exports.Tab.prototype.setModalState as (this: McpTab, state: { type: string; fileChooser?: { setFiles(files: string[]): Promise<void> } }) => void;
+  exports.Tab.prototype.setModalState = function (this: McpTab, state: { type: string; fileChooser?: { setFiles(files: string[]): Promise<void> } }) {
+    if (state.type !== "fileChooser") return setModalState.call(this, state);
+    void state.fileChooser?.setFiles([]).catch(() => {});
+    sessions.get(this.page.context())?.onUploadRefused();
   };
 
   const network = exports.browserTools.find((tool) => tool.schema.name === "browser_network_requests");

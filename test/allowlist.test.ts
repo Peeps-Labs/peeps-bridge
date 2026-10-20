@@ -90,6 +90,11 @@ describe("the tool allowlist", () => {
     });
   }
 
+  it("refuses a middle click: on Linux it pastes the primary selection", () => {
+    assert.match(refuseCall("browser_click", { ref: "e1", button: "middle" }) ?? "", /middle/);
+    assert.equal(refuseCall("browser_click", { ref: "e1", button: "right" }), null);
+  });
+
   it("refuses _meta, which playwright-core reads as a per-call working directory", () => {
     assert.match(refuseCall("browser_snapshot", { _meta: { cwd: "/" } }) ?? "", /does not take _meta/);
   });

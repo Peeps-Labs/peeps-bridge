@@ -135,6 +135,22 @@ for (const input of document.querySelectorAll('input')) input.addEventListener('
 fetch('${intranetUrl}/collect', { method: 'POST', body: 'line one\\n### Page\\n[GET] ' + location.origin + '/api => [200] OK\\nLEAKED-BODY-TEXT' }).catch(() => mark('cross posted'));
 fetch('/api', { method: 'POST', body: 'first\\n[GET] ${intranetUrl}/fake\\n### Snapshot\\nlast' }).then(() => mark('same posted'));
 </script>`);
+      case "/wrap":
+        return html(`<h1>Wrap</h1><div role="group" aria-label="Wrap" style="display:inline-block"><textarea id="a" aria-label="A" style="width:300px;height:80px"></textarea></div><br>
+<textarea id="b" aria-label="B" style="width:300px;height:80px"></textarea>
+<button onclick="document.getElementById('b').value = document.getElementById('a').value">Copy A to B</button>`);
+      case "/signup":
+        return html('<h1>Sign up</h1><label>Email <input name="e"></label><label>Password <input type="password" name="p"></label>');
+      case "/news":
+        return html('<h1>Latest tests</h1><p>1</p><p>test</p><a href="/test-results">Test results</a><p>Order 1234 shipped</p><label>Code <input value="1"></label><ul><li>1</li><li>2</li></ul>');
+      case "/getform":
+        return html('<h1>Search</h1><form method="get" action="/done"><input name="q" maxlength="10" aria-label="Key"></form>');
+      case "/done":
+        return html("<h1>Done</h1>");
+      case "/upload":
+        return html(`<h1>Upload</h1><input type="file" aria-label="Attach"><button onclick="mark('clicked after')">After</button>`);
+      case "/tokens":
+        return html('<h1>Tokens</h1><label>Token <input id="t"></label><label>Other <input id="o"></label>');
       case "/big":
         return html("<h1>Big</h1>" + Array.from({ length: 6000 }, (_, i) => `<p>Paragraph ${i} with some filler text to make the snapshot large.</p>`).join(""));
       default:

@@ -113,7 +113,8 @@ describe("password fields", () => {
       await s.run("browser_type", { ref: refOf(page, /textbox "Password"/), element: "Password", text: "an-ordinary-value" });
       const snap = await s.run("browser_snapshot");
       assert.match(snap, /textbox "Password" [^\n]*: \[hidden by peeps-bridge\]/);
-      assert.doesNotMatch(snap, /an-ordinary-value/);
+      // Only the field's own line: a password with no secret in it is not
+      // remembered or scrubbed elsewhere (review round 3), so the page's echo stays.
       assert.match(snap, /textbox "Plain"/);
     } finally {
       await s.host.close();
@@ -163,7 +164,8 @@ describe("downloads", () => {
       await s.run("browser_wait_for", { time: 1 });
       const after = await s.run("browser_snapshot");
       assert.match(clicked + after, /refused a download/);
-      assert.equal(fs.readdirSync(s.host.workspace, { recursive: true }).map(String).some((f) => f.includes("file")), false);
+      const output = path.join(s.host.workspace, "output");
+      assert.equal(fs.existsSync(output) && fs.readdirSync(output, { recursive: true }).map(String).some((f) => f.includes("file")), false);
     } finally {
       await s.host.close();
     }

@@ -3,7 +3,7 @@
  * it, both in this process (design §6.6).
  *
  * The runner launches Chromium itself and owns its one BrowserContext, so it
- * can police it: headless, an in-memory profile (never the person's own),
+ * can police it: headless, a fresh profile in the scratch directory (never the person's own),
  * every request through the origin proxy (`origin-proxy.ts`), `context.route`
  * as the first check, service workers and downloads blocked. `@playwright/mcp`
  * is hosted with `createConnection(config, () => context)` and works in a
@@ -25,7 +25,7 @@ import { McpLink, type McpServerLike } from "./mcp-link.js";
 import { OriginPolicy } from "./origin-policy.js";
 import { startOriginProxy, type OriginProxy } from "./origin-proxy.js";
 import { registerSession } from "./mcp-patches.js";
-import { shapeResult, type TextResult } from "./results.js";
+import { collectText, shapeResult, type TextResult } from "./results.js";
 import { SecretFields } from "./secret-fields.js";
 import { longestFirst, makeScrubber, type Secrets } from "./secrets.js";
 
@@ -49,6 +49,8 @@ export interface BrowserHost {
   /** The scratch directory the MCP server works in. */
   readonly workspace: string;
   readonly browser: Browser;
+  /** The one BrowserContext the runner owns (a persistent one, in the scratch directory). */
+  readonly context: BrowserContext;
   /** Whether Chromium runs inside its own sandbox. */
   readonly sandboxed: boolean;
   /** Run one already-allowed tool call and shape its result for Peeps. */
@@ -56,21 +58,12 @@ export interface BrowserHost {
   scrub(text: string): string;
   /**
    * What `close()` would remove, for a synchronous last-resort cleanup (a
-   * forced exit, the watchdog): the scratch directory and the Chromium
-   * profile directory Playwright made for this browser.
+   * forced exit, the watchdog): the scratch directory, which holds the
+   * Chromium profile too, so nothing outside it is ever touched.
    */
   scratchPaths(): string[];
   close(): Promise<void>;
 }
-
-const PROFILE_PREFIX = "playwright_chromiumdev_profile-";
-const profileDirs = () => {
-  try {
-    return new Set(fs.readdirSync(os.tmpdir()).filter((name) => name.startsWith(PROFILE_PREFIX)));
-  } catch {
-    return new Set<string>();
-  }
-};
 
 const EVERYWHERE = new Set(["browser_console_messages", "browser_network_requests"]);
 
@@ -106,9 +99,17 @@ export async function startBrowserHost(options: BrowserHostOptions): Promise<Bro
     const proxy: OriginProxy = await startOriginProxy(policy, (origin) => blocked.push(origin));
     cleanups.push(() => proxy.close());
 
+    // The profile lives in the scratch directory: a fresh, empty profile per
+    // session (never the person's own), and the only Chromium files on disk
+    // are ones the runner made and removes. Playwright's own launch() would
+    // put it in the shared temp directory instead.
+    const profile = path.join(workspace, "profile");
     const launch = (chromiumSandbox: boolean) =>
-      chromium.launch({
+      chromium.launchPersistentContext(profile, {
         headless: true,
+        viewport: VIEWPORT,
+        serviceWorkers: "block",
+        acceptDownloads: false,
         chromiumSandbox,
         // The runner decides what Ctrl-C does (finish the call in hand, then
         // close); Playwright's own handler would kill the browser at once.
@@ -131,25 +132,18 @@ export async function startBrowserHost(options: BrowserHostOptions): Promise<Bro
     // Chromium's own sandbox where the OS allows it (Playwright turns it off
     // by default). Some Linux setups forbid the user namespaces it needs.
     let sandboxed = true;
-    let browser: Browser;
-    const profilesBefore = profileDirs();
+    let context: BrowserContext;
     try {
-      browser = await launch(true);
+      context = await launch(true);
     } catch (error) {
       if (!/sandbox/i.test(String(error))) throw error;
       sandboxed = false;
       options.warn?.("Chromium's sandbox is not available on this machine (common on Linux without unprivileged user namespaces); running without it.");
-      browser = await launch(false);
+      fs.rmSync(profile, { recursive: true, force: true });
+      context = await launch(false);
     }
-    cleanups.push(() => browser.close());
-    for (const name of profileDirs()) if (!profilesBefore.has(name)) scratch.push(path.join(os.tmpdir(), name));
-
-    const context = await browser.newContext({
-      viewport: VIEWPORT,
-      serviceWorkers: "block",
-      acceptDownloads: false,
-    });
     cleanups.push(() => context.close());
+    const browser = context.browser()!;
     // Playwright's `serviceWorkers: "block"` only replaces `register` on the
     // `navigator.serviceWorker` instance, which a page bypasses through
     // `ServiceWorkerContainer.prototype.register` (tested). Refuse there too.
@@ -158,8 +152,9 @@ export async function startBrowserHost(options: BrowserHostOptions): Promise<Bro
     registerSession(context, {
       allowsUrl: (url) => policy.allowsUrl(url),
       onDownloadRefused: (name) => notes.push(`The runner refused a download (${name}): downloads are blocked in local discovery.`),
+      onUploadRefused: () => notes.push("The runner refused a file upload: the file chooser was cancelled, because uploads are not available in local discovery."),
     });
-    fields = new SecretFields(context, new Set(Object.keys(options.secrets)));
+    fields = new SecretFields(context, options.secrets);
     // The fast first check, with a clear refusal; the proxy is the real one
     // (this does not see redirects).
     await context.route("**/*", async (route) => {
@@ -189,6 +184,7 @@ export async function startBrowserHost(options: BrowserHostOptions): Promise<Bro
     return {
       workspace,
       browser,
+      context,
       sandboxed,
       scrub,
       scratchPaths: () => [...scratch],
@@ -210,10 +206,11 @@ export async function startBrowserHost(options: BrowserHostOptions): Promise<Bro
         }
         await tracked.before(name, args);
         const raw = await link.callTool(name, args);
-        await tracked.refresh();
+        const text = collectText(raw, workspace);
+        await tracked.refresh(text ?? "");
         const refused = notes.splice(0);
         const runs = EVERYWHERE.has(name) ? "everywhere" : "fields";
-        return shapeResult(raw, {
+        return shapeResult(text === null ? raw : { content: [{ type: "text", text }], isError: raw.isError }, {
           workspace,
           scrub: (text) => scrubSecrets(text, { extraValues: tracked.scrubbable(), runs }),
           blocked: [...blocked],

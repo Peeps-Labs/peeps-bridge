@@ -16,6 +16,9 @@ export function refuseCall(tool: string, args: Record<string, unknown>): string 
   if (!definition) return `${tool} is not available on this runner.`;
   const problem = check(definition.inputSchema, args, "arguments");
   if (problem) return `${tool} was refused by the runner: ${problem}.`;
+  if (tool === "browser_click" && args.button === "middle") {
+    return "browser_click was refused by the runner: a middle click pastes the primary selection on Linux, which could move a field's text where it is not hidden.";
+  }
   if (tool === "browser_press_key" && isClipboardKey(String(args.key))) {
     return "browser_press_key was refused by the runner: clipboard keys (copy, cut, paste) are not available, so a field's text cannot be moved to where it is not hidden.";
   }

@@ -15,8 +15,8 @@
  *   value is caught. Where depends on `runs`: everywhere (console and network
  *   output, printed lines), or with `"fields"` only in the places a typed
  *   value shows up in a snapshot: the value of an editable field's line
- *   (textbox, searchbox, combobox, spinbutton) and the Page URL and Page
- *   Title lines. Not in accessible names, headings or other page text, where
+ *   (textbox, searchbox, combobox, spinbutton), the Page URL and Page Title
+ *   lines, and the title and URL of each tab under `### Open tabs`. Not in accessible names, headings or other page text, where
  *   it hid ordinary words ("Password" for a secret containing "password");
  * - extra values the caller passes: the current contents of fields that were
  *   filled from a secret, and of password fields (`secret-fields.ts`).
@@ -96,6 +96,8 @@ const token = (n: number) => `${[...n.toString(16)].map((d) => String.fromCha
 const TOKEN = /([-]+)/g;
 const MARKER = /<secret>([^<>\n]{1,100})<\/secret>/g;
 const PAGE_LINE = /^(\s*- Page (?:URL|Title): )(.*)$/;
+// `### Open tabs`: `- 1: (current) [Title](url)`, title and URL of every tab.
+const TAB_LINE = /^(- \d+:(?: \(current\))? )(.*)$/;
 // Linear: a literal role, an optional quoted name, then bracketed attributes.
 const EDITABLE_LINE = /^(\s*- (?:textbox|searchbox|combobox|spinbutton)(?: "(?:[^"\\]|\\.)*")?(?: \[[^\]\n]*\])*: )(.*)$/;
 
@@ -149,7 +151,7 @@ export function makeScrubber(secrets: Secrets): (text: string, options?: ScrubOp
           : out
               .split("\n")
               .map((line) => {
-                const match = PAGE_LINE.exec(line) ?? EDITABLE_LINE.exec(line);
+                const match = PAGE_LINE.exec(line) ?? TAB_LINE.exec(line) ?? EDITABLE_LINE.exec(line);
                 return match ? match[1]! + applyRuns(match[2]!) : line;
               })
               .join("\n");

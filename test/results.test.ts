@@ -158,7 +158,7 @@ describe("renderNetworkLog", () => {
 describe("linear time on adversarial input", () => {
   it("masks, scrubs and shapes a 1 MB line of brackets in well under a second", () => {
     const line = "- paragraph [ref=e1]x" + " [ref=a]".repeat(130_000);
-    const fields = new SecretFields({ pages: () => [] } as never, new Set());
+    const fields = new SecretFields({ pages: () => [] } as never, {});
     const scrub = makeScrubber({ PW: "Zq8vK3mW9xT2", B: "test-password" });
     const started = Date.now();
     fields.mask(line);

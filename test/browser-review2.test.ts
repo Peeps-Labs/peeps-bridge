@@ -57,11 +57,14 @@ describe("values seen once stay scrubbed", () => {
     const s = await session(sites.appUrl, { PW }, tmpRoot);
     try {
       const page = await s.run("browser_navigate", { url: `${sites.appUrl}/logged` });
-      await s.run("browser_type", { ref: refOf(page, /textbox "Password"/), element: "Password", text: "an-ordinary-value" });
+      await s.run("browser_type", { ref: refOf(page, /textbox "Plain"/), element: "Plain", text: "PW" });
+      // Down to "Zq8vK": shorter than the run rule's 6, so only the field's
+      // remembered contents can catch it.
+      for (let i = 0; i < 7; i++) await s.run("browser_press_key", { key: "Backspace" });
       await s.run("browser_navigate", { url: `${sites.appUrl}/paragraphs` });
       const log = await s.run("browser_console_messages", { level: "debug", all: true });
-      assert.match(log, /input pw = /);
-      assert.doesNotMatch(log, /an-ordinary-value/);
+      assert.match(log, /input plain = /);
+      assert.doesNotMatch(log, /Zq8vK/);
     } finally {
       await s.host.close();
     }
@@ -97,7 +100,7 @@ describe("clipboard and drag", () => {
       await s.run("browser_press_key", { key: "ControlOrMeta+a" });
       const dragged = await s.call("browser_drag", { startElement: "A", startRef: a, endElement: "B", endRef: b });
       assert.match(JSON.stringify(dragged), /refused/);
-      const value = await s.host.browser.contexts()[0]!.pages()[0]!.locator("textarea[name=b]").inputValue();
+      const value = await s.host.context.pages()[0]!.locator("textarea[name=b]").inputValue();
       assert.equal(value, "");
     } finally {
       await s.host.close();

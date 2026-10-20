@@ -59,6 +59,7 @@ function fakeHost(answer: (name: string) => Promise<{ content: { type: "text"; t
     browser: undefined as never,
     sandboxed: true,
     scratchPaths: () => [],
+    context: undefined as never,
     scrub,
     async callTool(name: string, args: Record<string, unknown>) {
       calls.push([name, args]);

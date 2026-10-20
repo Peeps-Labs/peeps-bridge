@@ -33,21 +33,30 @@ const SNAPSHOT_LINK = /^- \[Snapshot\]\(([^)\n]+)\)$/gm;
 const CONSOLE_LINK = /^- New console entries: .*$/gm;
 const FILE_LINK = /^- \[([^\]\n]+)\]\((?![a-z][a-z0-9+.-]*:\/\/)[^)\n]+\)$/gim;
 
-export function shapeResult(raw: { content?: unknown; isError?: unknown }, options: ShapeOptions): TextResult {
+/**
+ * A result's text parts joined, with the action's snapshot file inlined and
+ * links to other files on this machine dropped; null when it has no text.
+ */
+export function collectText(raw: { content?: unknown }, workspace: string): string | null {
   const parts = Array.isArray(raw?.content) ? (raw.content as { type?: unknown; text?: unknown }[]) : [];
   const texts = parts.filter((p) => p?.type === "text" && typeof p.text === "string").map((p) => p.text as string);
-  if (texts.length === 0) {
-    return { content: [{ type: "text", text: "The browser returned no text for this call." }], isError: true };
-  }
-
-  let text = texts
+  if (texts.length === 0) return null;
+  return texts
     .join("\n")
     .replace(SNAPSHOT_LINK, (_line, link: string) => {
-      const yaml = readInside(options.workspace, link);
+      const yaml = readInside(workspace, link);
       return yaml === null ? "(the snapshot was not available)" : "```yaml\n" + yaml.replace(/\n$/, "") + "\n```";
     })
     .replace(CONSOLE_LINK, "- New console entries: call browser_console_messages to read them")
     .replace(FILE_LINK, (_line, title: string) => `- ${title}: (a file on the runner; not sent)`);
+}
+
+export function shapeResult(raw: { content?: unknown; isError?: unknown }, options: ShapeOptions): TextResult {
+  const collected = collectText(raw, options.workspace);
+  if (collected === null) {
+    return { content: [{ type: "text", text: "The browser returned no text for this call." }], isError: true };
+  }
+  let text = collected;
 
   const blocked = [...new Set(options.blocked ?? [])];
   const notes = [...new Set(options.notes ?? [])];

@@ -381,4 +381,74 @@ describe("the peeps-bridge process", () => {
       await p.cleanup();
     }
   });
+
+  it("cleans up when its terminal closes, though writing to it then fails (real pty)", { skip: process.platform === "win32" }, async () => {
+    const sites = await startSites();
+    const bridge = await new FakeBridge().start();
+    bridge.callReplies.push(call(1, "browser_snapshot", {}), call(2, "browser_wait_for", { time: 30 }));
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-pty-"));
+    try {
+      const result = await new Promise<string>((resolve, reject) => {
+        const py = spawn(
+          "python3",
+          ["test/fixtures/pty-close.py", "#1 ", process.execPath, "--import", "tsx", "src/bin.ts", "--server", bridge.url, "--session", SESSION_ID, "--target-url", `${sites.appUrl}/`],
+          { env: { ...process.env, PEEPS_RUNNER_GRANT: GRANT, TMPDIR: tmp, TMP: tmp, TEMP: tmp }, stdio: ["ignore", "pipe", "inherit"] },
+        );
+        let out = "";
+        py.stdout.on("data", (c) => (out += c));
+        py.on("error", reject);
+        py.on("exit", () => resolve(out));
+      });
+      const report = JSON.parse(result) as { seen: boolean; seconds: number; exitcode: number; output: string };
+      assert.ok(report.seen, report.output);
+      assert.ok(report.seconds < 16, `took ${report.seconds} s`);
+      await new Promise((r) => setTimeout(r, 500));
+      assert.deepEqual(fs.readdirSync(tmp).filter((d) => d.startsWith("peeps-bridge-")), []);
+    } finally {
+      await bridge.stop();
+      await sites.close();
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  it("never deletes a Chromium profile directory another program made", async () => {
+    const sites = await startSites();
+    const bridge = await new FakeBridge().start();
+    bridge.callReplies.push(call(1, "browser_snapshot", {}), call(2, "browser_wait_for", { time: 30 }));
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-proc-"));
+    const someoneElses = path.join(tmp, "playwright_chromiumdev_profile-someone-else");
+    const anotherOne = path.join(tmp, "playwright_chromiumdev_profile-another-one");
+    fs.mkdirSync(someoneElses);
+    try {
+      const child = spawn(
+        process.execPath,
+        ["--import", "tsx", "src/bin.ts", "--server", bridge.url, "--session", SESSION_ID, "--target-url", `${sites.appUrl}/`],
+        { env: { ...process.env, PEEPS_RUNNER_GRANT: GRANT, TMPDIR: tmp, TMP: tmp, TEMP: tmp }, stdio: ["ignore", "pipe", "pipe"] },
+      );
+      let output = "";
+      child.stdout.on("data", (c) => (output += c));
+      child.stderr.on("data", (c) => (output += c));
+      // Made while the runner is starting its browser: the moment anything
+      // appears in the shared temp directory.
+      // ...and one made while the runner starts its browser, the moment
+      // anything else appears in the shared temp directory.
+      const watcher = fs.watch(tmp, (_event, name) => {
+        if (!String(name).endsWith("another-one") && !fs.existsSync(anotherOne)) fs.mkdirSync(anotherOne);
+      });
+      const deadline = Date.now() + 30_000;
+      while (!/#1 /.test(output) && Date.now() < deadline) await new Promise((r) => setTimeout(r, 100));
+      const exited = new Promise((resolve) => child.on("exit", resolve));
+      child.kill("SIGINT");
+      await new Promise((r) => setTimeout(r, 300));
+      child.kill("SIGINT");
+      await exited;
+      watcher.close();
+      assert.equal(fs.existsSync(someoneElses), true);
+      assert.equal(fs.existsSync(anotherOne), true);
+    } finally {
+      await bridge.stop();
+      await sites.close();
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
 });
