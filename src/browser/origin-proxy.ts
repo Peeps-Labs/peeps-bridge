@@ -67,9 +67,16 @@ export async function startOriginProxy(policy: OriginPolicy, onRefused: (originO
         upstreamRes.pipe(res);
       },
     );
+    upstream.on("socket", track);
     upstream.on("error", () => {
+      if (res.destroyed) return;
       if (!res.headersSent) res.writeHead(502, { "content-type": "text/plain" });
       res.end(`peeps-bridge could not reach ${target.origin}.\n`);
+    });
+    // The browser went away (a closed tab, an SSE stream it dropped): so does
+    // the upstream request, rather than streaming into nowhere.
+    res.on("close", () => {
+      if (!res.writableFinished) upstream.destroy();
     });
     req.pipe(upstream);
   });

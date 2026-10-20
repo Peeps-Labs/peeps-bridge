@@ -174,3 +174,73 @@ describe("the origin proxy and allowed upgrades", () => {
     }
   });
 });
+
+describe("the origin proxy and long-lived responses", () => {
+  /** An SSE endpoint that reports when its request goes away. */
+  async function sse() {
+    let opened = 0;
+    let closed = 0;
+    const server = http.createServer((req, res) => {
+      opened += 1;
+      res.writeHead(200, { "content-type": "text/event-stream" });
+      res.write("data: hello\n\n");
+      const timer = setInterval(() => res.write("data: tick\n\n"), 50);
+      req.socket.on("close", () => {
+        clearInterval(timer);
+        closed += 1;
+      });
+    });
+    const port = await listen(server);
+    return { server, port, opened: () => opened, closed: () => closed };
+  }
+
+  const until = async (check: () => boolean, ms = 2000) => {
+    const deadline = Date.now() + ms;
+    while (!check() && Date.now() < deadline) await new Promise((r) => setTimeout(r, 20));
+    return check();
+  };
+
+  it("closes the upstream request when the browser goes away", async () => {
+    const s = await sse();
+    const p = await startOriginProxy(OriginPolicy.from(`http://127.0.0.1:${s.port}/`, []), () => {});
+    try {
+      const proxyUrl = new URL(p.url);
+      await new Promise<void>((resolve, reject) => {
+        const req = http.request({ host: proxyUrl.hostname, port: proxyUrl.port, path: `http://127.0.0.1:${s.port}/events` }, (res) => {
+          res.once("data", () => {
+            req.destroy();
+            resolve();
+          });
+        });
+        req.on("error", () => {});
+        req.on("timeout", reject);
+        req.end();
+      });
+      assert.equal(await until(() => s.closed() === 1), true, "the upstream SSE request was still open");
+    } finally {
+      await p.close();
+      s.server.closeAllConnections();
+      s.server.close();
+    }
+  });
+
+  it("closes upstream connections when the proxy closes", async () => {
+    const s = await sse();
+    const p = await startOriginProxy(OriginPolicy.from(`http://127.0.0.1:${s.port}/`, []), () => {});
+    const proxyUrl = new URL(p.url);
+    const client = http.request({ host: proxyUrl.hostname, port: proxyUrl.port, path: `http://127.0.0.1:${s.port}/events` });
+    client.on("error", () => {});
+    await new Promise<void>((resolve) => {
+      client.on("response", (res) => res.once("data", () => resolve()));
+      client.end();
+    });
+    await p.close();
+    try {
+      assert.equal(await until(() => s.closed() === 1), true, "an upstream connection outlived proxy.close()");
+    } finally {
+      client.destroy();
+      s.server.closeAllConnections();
+      s.server.close();
+    }
+  });
+});
