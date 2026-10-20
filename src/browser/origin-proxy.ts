@@ -44,6 +44,8 @@ const refusalBody = (what: string) => `Blocked by peeps-bridge: ${what} is not a
 export async function startOriginProxy(policy: OriginPolicy, onRefused: (originOrAuthority: string) => void): Promise<OriginProxy> {
   const sockets = new Set<net.Socket | Duplex>();
   const track = (socket: net.Socket | Duplex) => {
+    // A kept-alive socket serves many requests: one listener, not one each.
+    if (sockets.has(socket)) return;
     sockets.add(socket);
     socket.on("close", () => sockets.delete(socket));
   };
@@ -65,6 +67,14 @@ export async function startOriginProxy(policy: OriginPolicy, onRefused: (originO
       (upstreamRes) => {
         res.writeHead(upstreamRes.statusCode ?? 502, upstreamRes.statusMessage, forwardableHeaders(upstreamRes.headers));
         upstreamRes.pipe(res);
+        // Upstream broke off mid-response: so does the browser's, rather than
+        // waiting for an end that never comes (an SSE client then reconnects).
+        const brokenOff = () => {
+          if (!upstreamRes.complete) res.destroy();
+        };
+        upstreamRes.on("aborted", brokenOff);
+        upstreamRes.on("error", brokenOff);
+        upstreamRes.on("close", brokenOff);
       },
     );
     upstream.on("socket", track);

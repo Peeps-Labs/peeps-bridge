@@ -27,8 +27,13 @@ let forcing = false;
 const force = async () => {
   if (forcing) return;
   forcing = true;
-  // Synchronous: process.exit below would drop a pending pipe write.
-  fs.writeSync(1, "[peeps] closing the browser now\n");
+  // Synchronous: process.exit below would drop a pending pipe write. The
+  // terminal may be gone (EIO after SIGHUP): the cleanup must still run.
+  try {
+    fs.writeSync(1, "[peeps] closing the browser now\n");
+  } catch {
+    // Nobody left to tell.
+  }
   await Promise.race([host?.close(), new Promise((resolve) => setTimeout(resolve, CLOSE_GRACE_MS))]);
   // Whatever close() did not get to: the scratch and profile directories.
   for (const directory of host?.scratchPaths() ?? []) {

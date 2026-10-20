@@ -5,6 +5,12 @@
  * the main loop's heartbeat stop, removes the scratch directory, and kills the
  * process. Chromium exits with its parent (Playwright drives it over a pipe).
  *
+ * A laptop that sleeps suspends both threads. Times are monotonic
+ * (`performance`), which on Linux and macOS do not advance during suspend;
+ * and where a clock does jump, the worker sees its own tick arrive late and
+ * gives the main thread a full `stallMs` from the resume before calling it a
+ * stall (`stallDecision`).
+ *
  * Nothing the runner does legitimately blocks the loop for more than a
  * moment: browser calls are asynchronous and bounded by their own timeouts.
  */
@@ -17,31 +23,60 @@ export interface Watchdog {
   stop(): void;
 }
 
+export interface StallState {
+  /** When the worker last ticked. */
+  lastTick: number;
+  /** When the worker last found it had been suspended. */
+  resumedAt: number;
+}
+
+/**
+ * One worker tick: is the main thread stalled? Pure, and serialised into the
+ * worker with `toString()`, so it may use nothing outside itself.
+ */
+export function stallDecision(state: StallState, now: number, beat: number, stallMs: number, tickMs: number): { state: StallState; kill: boolean } {
+  const suspended = now - state.lastTick > tickMs * 4;
+  const resumedAt = suspended ? now : state.resumedAt;
+  const since = Math.max(beat, resumedAt);
+  return { state: { lastTick: now, resumedAt }, kill: now - since >= stallMs };
+}
+
 const WORKER = `
 const { workerData, parentPort } = require("node:worker_threads");
 const fs = require("node:fs");
-const beat = new BigInt64Array(workerData.shared);
+const stallDecision = ${stallDecision.toString()};
+const beat = new Float64Array(workerData.shared);
+const now = () => performance.timeOrigin + performance.now();
 const scratch = [];
 parentPort.on("message", (directory) => scratch.push(directory));
+let state = { lastTick: now(), resumedAt: 0 };
 setInterval(() => {
-  const silent = Date.now() - Number(Atomics.load(beat, 0));
-  if (silent < workerData.stallMs) return;
-  fs.writeSync(2, "\\n[peeps] the runner's event loop has been blocked for " + Math.round(silent / 1000) + " s; closing the browser and exiting.\\n");
+  const t = now();
+  const decision = stallDecision(state, t, beat[0], workerData.stallMs, workerData.tickMs);
+  state = decision.state;
+  if (!decision.kill) return;
+  // The terminal may be gone (EIO): the cleanup and the kill must still run.
+  try {
+    fs.writeSync(2, "\\n[peeps] the runner's event loop has been blocked for " + Math.round((t - beat[0]) / 1000) + " s; closing the browser and exiting.\\n");
+  } catch {}
   for (const directory of scratch) {
     try { fs.rmSync(directory, { recursive: true, force: true }); } catch {}
   }
   process.kill(workerData.pid, "SIGKILL");
-}, Math.min(1000, Math.max(50, Math.floor(workerData.stallMs / 4))));
+}, workerData.tickMs);
 `;
 
 export function startEventLoopWatchdog(options: { stallMs: number }): Watchdog {
   const shared = new SharedArrayBuffer(8);
-  const beat = new BigInt64Array(shared);
-  const tick = () => Atomics.store(beat, 0, BigInt(Date.now()));
+  const beat = new Float64Array(shared);
+  const tick = () => {
+    beat[0] = performance.timeOrigin + performance.now();
+  };
   tick();
   const heartbeat = setInterval(tick, Math.max(25, Math.floor(options.stallMs / 8)));
   heartbeat.unref();
-  const worker = new Worker(WORKER, { eval: true, workerData: { shared, stallMs: options.stallMs, pid: process.pid } });
+  const tickMs = Math.min(1000, Math.max(50, Math.floor(options.stallMs / 4)));
+  const worker = new Worker(WORKER, { eval: true, workerData: { shared, stallMs: options.stallMs, tickMs, pid: process.pid } });
   worker.unref();
   return {
     scratch: (directory) => worker.postMessage(directory),

@@ -5,6 +5,8 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
+import { stallDecision } from "../src/watchdog.js";
+
 function runChild(mode: "stall" | "healthy") {
   const scratch = path.join(fs.mkdtempSync(path.join(os.tmpdir(), "bridge-watchdog-")), "scratch");
   const child = spawn(process.execPath, ["--import", "tsx", "test/fixtures/watchdog-child.ts", mode, scratch], { stdio: ["ignore", "pipe", "pipe"] });
@@ -33,5 +35,36 @@ describe("the event-loop watchdog", () => {
     assert.equal(result.code, 0, result.output);
     assert.match(result.output, /done/);
     fs.rmSync(path.dirname(result.scratch), { recursive: true, force: true });
+  });
+});
+
+describe("the watchdog's stall decision", () => {
+  const TICK = 1000;
+  const STALL = 30_000;
+
+  it("declares a stall when the heartbeat stops while the worker keeps ticking", () => {
+    let state = { lastTick: 0, resumedAt: 0 };
+    let kill = false;
+    for (let now = TICK; now <= 31_000 && !kill; now += TICK) ({ state, kill } = stallDecision(state, now, 0, STALL, TICK));
+    assert.equal(kill, true);
+  });
+
+  it("does not, right after the whole machine was suspended (both threads' clocks jumped)", () => {
+    // Laptop sleep: the worker's own tick arrives 2 hours late, and the
+    // heartbeat is as old as the sleep.
+    const before = 10_000;
+    let { state, kill } = stallDecision({ lastTick: before, resumedAt: 0 }, before + 2 * 3600_000, before, STALL, TICK);
+    assert.equal(kill, false);
+    // The main thread resumes beating: still fine afterwards.
+    ({ state, kill } = stallDecision(state, before + 2 * 3600_000 + TICK, before + 2 * 3600_000 + 500, STALL, TICK));
+    assert.equal(kill, false);
+  });
+
+  it("still catches a real stall that starts after the machine resumed", () => {
+    const resumed = 2 * 3600_000;
+    let { state, kill } = stallDecision({ lastTick: 0, resumedAt: 0 }, resumed, 0, STALL, TICK);
+    assert.equal(kill, false);
+    for (let now = resumed + TICK; now <= resumed + 31_000 && !kill; now += TICK) ({ state, kill } = stallDecision(state, now, 0, STALL, TICK));
+    assert.equal(kill, true);
   });
 });

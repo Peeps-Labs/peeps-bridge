@@ -244,3 +244,61 @@ describe("the origin proxy and long-lived responses", () => {
     }
   });
 });
+
+describe("the origin proxy and broken or many responses", () => {
+  it("ends the browser's response when the upstream one breaks off, so nothing hangs", async () => {
+    const broken = http.createServer((_req, res) => {
+      res.writeHead(200, { "content-type": "text/event-stream" });
+      res.write("data: first\n\n");
+      setTimeout(() => res.socket?.destroy(), 100);
+    });
+    const port = await listen(broken);
+    const p = await startOriginProxy(OriginPolicy.from(`http://127.0.0.1:${port}/`, []), () => {});
+    try {
+      const proxyUrl = new URL(p.url);
+      const ended = await new Promise<string>((resolve) => {
+        const req = http.request({ host: proxyUrl.hostname, port: proxyUrl.port, path: `http://127.0.0.1:${port}/events` }, (res) => {
+          res.on("data", () => {});
+          res.on("close", () => resolve("closed"));
+          res.on("error", () => resolve("error"));
+        });
+        req.on("error", () => resolve("error"));
+        req.end();
+        setTimeout(() => resolve("hung"), 3000);
+      });
+      assert.notEqual(ended, "hung");
+    } finally {
+      await p.close();
+      broken.closeAllConnections();
+      broken.close();
+    }
+  });
+
+  it("adds no listener per request on a kept-alive connection", async () => {
+    const warnings: string[] = [];
+    const onWarning = (w: Error) => warnings.push(w.name);
+    process.on("warning", onWarning);
+    const ok = http.createServer((_req, res) => res.end("ok"));
+    const port = await listen(ok);
+    const p = await startOriginProxy(OriginPolicy.from(`http://127.0.0.1:${port}/`, []), () => {});
+    const agent = new http.Agent({ keepAlive: true, maxSockets: 1 });
+    try {
+      const proxyUrl = new URL(p.url);
+      for (let i = 0; i < 20; i++) {
+        await new Promise<void>((resolve, reject) =>
+          http.get({ host: proxyUrl.hostname, port: proxyUrl.port, path: `http://127.0.0.1:${port}/`, agent }, (res) => {
+            res.resume();
+            res.on("end", resolve);
+          }).on("error", reject),
+        );
+      }
+      await new Promise((r) => setImmediate(r));
+      assert.deepEqual(warnings.filter((w) => w === "MaxListenersExceededWarning"), []);
+    } finally {
+      process.off("warning", onWarning);
+      agent.destroy();
+      await p.close();
+      ok.close();
+    }
+  });
+});
