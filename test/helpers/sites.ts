@@ -83,6 +83,38 @@ const bad=new WebSocket('${intranetUrl.replace("http:", "ws:")}/sock'); bad.onop
         return html(`<h1>Sign in</h1><form method="post" action="/login">
 <label>Password <input name="password" type="text" oninput="document.getElementById('echo').textContent='Typed: '+this.value"></label>
 <p id="echo"></p><button type="submit">Sign in</button></form>`);
+      case "/fields":
+        return html(`<h1>Fields</h1>
+<label>Plain <input name="plain"></label>
+<label>Short <input name="short" maxlength="6"></label>
+<label>Password <input type="password" name="pw"></label>
+<label>Saved <input type="password" name="saved" value="pre-filled-saved-value"></label>
+<p id="echo"></p>
+<script>
+for (const input of document.querySelectorAll('input')) input.addEventListener('input', () => {
+  document.getElementById('echo').textContent = 'Typed: ' + input.value;
+  console.log('field ' + input.name + ' is ' + input.value);
+});
+</script>`);
+      case "/download":
+        return html('<h1>Download</h1><a href="/file.txt" download>Get the file</a>');
+      case "/file.txt":
+        return res.writeHead(200, { "content-type": "text/plain", "content-disposition": 'attachment; filename="file.txt"' }).end("file contents");
+      case "/webrtc":
+        return html(`<h1>WebRTC</h1>
+<script>
+const pc = new RTCPeerConnection({ iceServers: [{ urls: 'stun:127.0.0.1:${url.searchParams.get("port")}' }] });
+pc.createDataChannel('x');
+pc.onicegatheringstatechange = () => { if (pc.iceGatheringState === 'complete') mark('ice gathering complete'); };
+pc.createOffer().then((offer) => pc.setLocalDescription(offer)).then(() => mark('offer set'));
+</script>`);
+      case "/network":
+        return html(`<h1>Network</h1>
+<script>
+document.cookie = 'sid=cookie-value-abcdef';
+fetch('/api', { headers: { authorization: 'Bearer token-value-123456' } }).then(() => mark('same done'));
+fetch('${intranetUrl}/api').catch(() => mark('cross done'));
+</script>`);
       case "/big":
         return html("<h1>Big</h1>" + Array.from({ length: 6000 }, (_, i) => `<p>Paragraph ${i} with some filler text to make the snapshot large.</p>`).join(""));
       default:

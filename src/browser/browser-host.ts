@@ -24,8 +24,9 @@ import { chromium, type Browser, type BrowserContext } from "playwright-core";
 import { McpLink, type McpServerLike } from "./mcp-link.js";
 import { OriginPolicy } from "./origin-policy.js";
 import { startOriginProxy, type OriginProxy } from "./origin-proxy.js";
-import { shapeResult, type TextResult } from "./results.js";
-import { makeScrubber, type Secrets } from "./secrets.js";
+import { filterNetworkLog, shapeResult, type TextResult } from "./results.js";
+import { SecretFields } from "./secret-fields.js";
+import { longestFirst, makeScrubber, type Secrets } from "./secrets.js";
 
 const require = createRequire(import.meta.url);
 
@@ -61,13 +62,35 @@ const SERVICE_WORKER_BLOCK = `(() => {
   Object.defineProperty(ServiceWorkerContainer.prototype, "register", { value: refuse, writable: false, configurable: false });
 })();`;
 
+/**
+ * Downloads are refused (`acceptDownloads: false`), but Playwright still
+ * emits the event, and `@playwright/mcp`'s tab answers it with an unawaited
+ * `download.saveAs()` that then rejects: an unhandled rejection that kills
+ * this process. Replace that handler with one that cancels the download and
+ * tells the session's host, which says so in the next result.
+ */
+const downloadRefused = new WeakMap<BrowserContext, (name: string) => void>();
+let downloadsPatched = false;
+function refuseDownloads(): void {
+  if (downloadsPatched) return;
+  downloadsPatched = true;
+  const { Tab } = require("playwright-core/lib/tools/exports") as { Tab: { prototype: Record<string, unknown> } };
+  Tab.prototype._downloadStarted = async function (download: { suggestedFilename(): string; cancel(): Promise<void>; page(): { context(): BrowserContext } }) {
+    await download.cancel().catch(() => {});
+    downloadRefused.get(download.page().context())?.(download.suggestedFilename());
+  };
+}
+
 type CreateConnection = (config: object, contextGetter: () => Promise<BrowserContext>) => Promise<McpServerLike>;
 
 export async function startBrowserHost(options: BrowserHostOptions): Promise<BrowserHost> {
   const { policy } = options;
   const workspace = fs.mkdtempSync(path.join(options.tmpRoot ?? os.tmpdir(), "peeps-bridge-"));
-  const scrub = makeScrubber(options.secrets);
+  const scrubSecrets = makeScrubber(options.secrets);
   const blocked: string[] = [];
+  const notes: string[] = [];
+  let fields: SecretFields | null = null;
+  const scrub = (text: string) => scrubSecrets(text, fields?.scrubbable() ?? []);
   const cleanups: (() => Promise<unknown> | unknown)[] = [() => fs.rmSync(workspace, { recursive: true, force: true })];
   const cleanup = async () => {
     for (const step of cleanups.reverse()) {
@@ -90,7 +113,15 @@ export async function startBrowserHost(options: BrowserHostOptions): Promise<Bro
         // Loopback through the proxy too: the target is usually localhost, and
         // so is much of what the policy must keep the browser away from.
         proxy: { server: proxy.url, bypass: "<-loopback>" },
-        args: ["--disable-features=ThirdPartyCookieBlocking"],
+        args: [
+          "--disable-features=ThirdPartyCookieBlocking",
+          // WebRTC sends UDP straight to any host a page names (STUN, ICE),
+          // around the proxy. Only proxied traffic: with an HTTP proxy that
+          // means no UDP at all, and TURN over TCP goes through the proxy's
+          // CONNECT check. Pages can still use WebRTC APIs; they just cannot
+          // reach anyone the policy does not allow.
+          "--force-webrtc-ip-handling-policy=disable_non_proxied_udp",
+        ],
       });
     // Chromium's own sandbox where the OS allows it (Playwright turns it off
     // by default). Some Linux setups forbid the user namespaces it needs.
@@ -116,6 +147,9 @@ export async function startBrowserHost(options: BrowserHostOptions): Promise<Bro
     // `navigator.serviceWorker` instance, which a page bypasses through
     // `ServiceWorkerContainer.prototype.register` (tested). Refuse there too.
     await context.addInitScript(SERVICE_WORKER_BLOCK);
+    refuseDownloads();
+    downloadRefused.set(context, (name) => notes.push(`The runner refused a download (${name}): downloads are blocked in local discovery.`));
+    fields = new SecretFields(context, new Set(Object.keys(options.secrets)));
     // The fast first check, with a clear refusal; the proxy is the real one
     // (this does not see redirects).
     await context.route("**/*", async (route) => {
@@ -130,7 +164,9 @@ export async function startBrowserHost(options: BrowserHostOptions): Promise<Bro
       {
         browser: { browserName: "chromium", isolated: false },
         outputDir: path.join(workspace, "output"),
-        secrets: options.secrets,
+        // Longest first: Playwright redacts in insertion order, and a shorter
+        // secret inside a longer one would otherwise split it.
+        secrets: longestFirst(options.secrets),
         imageResponses: "omit",
         timeouts: { navigation: NAVIGATION_TIMEOUT_MS, action: ACTION_TIMEOUT_MS },
       },
@@ -147,8 +183,21 @@ export async function startBrowserHost(options: BrowserHostOptions): Promise<Bro
       scrub,
       async callTool(name, args) {
         blocked.length = 0;
+        const tracked = fields!;
+        await tracked.before(name, args);
         const raw = await link.callTool(name, args);
-        return shapeResult(raw, { workspace, scrub, blocked: [...blocked] });
+        await tracked.refresh();
+        const refused = notes.splice(0);
+        return shapeResult(raw, {
+          workspace,
+          scrub,
+          blocked: [...blocked],
+          notes: refused,
+          transform: (text) => {
+            const masked = tracked.mask(text);
+            return name === "browser_network_requests" ? filterNetworkLog(masked, (url) => policy.allowsUrl(url)) : masked;
+          },
+        });
       },
       async close() {
         if (closed) return;

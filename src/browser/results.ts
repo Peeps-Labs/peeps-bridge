@@ -25,6 +25,8 @@ export interface ShapeOptions {
   transform?: (text: string) => string;
   /** Origins the runner refused during this call. */
   blocked?: string[];
+  /** Other things the runner refused (a download), one line each. */
+  notes?: string[];
 }
 
 const REDACTED = "[redacted by peeps-bridge]";
@@ -85,8 +87,13 @@ export function shapeResult(raw: { content?: unknown; isError?: unknown }, optio
     .replace(FILE_LINK, (_line, title: string) => `- ${title}: (a file on the runner; not sent)`);
 
   const blocked = [...new Set(options.blocked ?? [])];
-  if (blocked.length > 0) {
-    text += `\n### Blocked\n- The runner blocked requests to origins outside this session's allowed list: ${blocked.join(", ")}. The person can allow one with --allow-origin.`;
+  const notes = [...new Set(options.notes ?? [])];
+  if (blocked.length > 0 || notes.length > 0) {
+    text += "\n### Blocked";
+    if (blocked.length > 0) {
+      text += `\n- The runner blocked requests to origins outside this session's allowed list: ${blocked.join(", ")}. The person can allow one with --allow-origin.`;
+    }
+    for (const note of notes) text += `\n- ${note}`;
   }
 
   if (options.transform) text = options.transform(text);
