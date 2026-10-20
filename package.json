@@ -1,0 +1,26 @@
+{
+  "name": "@peepsai/bridge",
+  "version": "0.1.0",
+  "description": "Runs a Peeps agent's browser tools on your machine, so Peeps can explore the app you are building at localhost.",
+  "license": "MIT",
+  "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
+  "dependencies": {
+    "@playwright/mcp": "0.0.69",
+    "playwright-core": "1.59.0-alpha-1774912654000"
+  },
+  "devDependencies": {
+    "@types/node": "22.20.5",
+    "tsx": "4.23.15",
+    "typescript": "5.9.3"
+  },
+  "scripts": {
+    "test": "node --test --import tsx \"test/**/*.test.ts\"",
+    "test:coverage": "node --test --import tsx --experimental-test-coverage --test-coverage-include=\"src/**\" \"test/**/*.test.ts\"",
+    "typecheck": "tsc --noEmit",
+    "build": "rm -rf dist && tsc -p tsconfig.build.json",
+    "lint": "eslint ."
+  }
+}

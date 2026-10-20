@@ -1,0 +1,268 @@
+/**
+ * The bridge protocol, runner side: attach to a Peeps agent session, long-poll
+ * for tool calls, run each one, post its outcome, and leave when Peeps ends
+ * the session, when it expires, or when Peeps cannot be reached.
+ *
+ * It knows nothing about browsers or files: a caller supplies the tools it
+ * offers and a `handle` that runs one call. `peeps-action`'s CI agent and the
+ * local `peeps-bridge` runner share it.
+ *
+ * The server's contract (Peeps `src/app/api/v1/bridge/sessions/[sessionId]/*`):
+ * - `POST …/attach` `{ tools, runnerInfo }` → `{ sessionId, kind, expiresAt }`.
+ * - `GET …/calls?wait=25` → `{ call }`, 204 when idle, 410 when over. Every
+ *   poll is the heartbeat; a runner silent for 3 minutes is presumed dead, so
+ *   the backoff below stays far inside that.
+ * - `POST …/calls/<id>/result` `{ ok: true, result }` or `{ ok: false, error }`.
+ *   It is also a heartbeat, and answers 410 once the session is over.
+ * - 401 `invalid_token` (any failed grant or authority check), 409
+ *   `other_runner` / `other_job` / `playwright_mcp_version`, 404 `not_found`.
+ */
+
+export interface BridgeToolSpec {
+  name: string;
+  description: string;
+  inputSchema: Record<string, unknown>;
+}
+
+export interface BridgeCall {
+  id: string;
+  seq: number;
+  tool: string;
+  args: Record<string, unknown>;
+}
+
+export type CallOutcome = { ok: true; result: unknown } | { ok: false; error: string };
+
+export interface BridgeSessionOptions {
+  /** Peeps' base URL, e.g. `https://app.peepsai.com`. */
+  server: string;
+  sessionId: string;
+  /** The full `Authorization` header value; called before every request. */
+  authorization: () => string | Promise<string>;
+  /** Extra headers on every request (a local runner's `x-peeps-runner-instance`). */
+  headers?: Record<string, string>;
+  tools: BridgeToolSpec[];
+  runnerInfo: Record<string, unknown>;
+  handle: (call: BridgeCall) => Promise<CallOutcome>;
+  log: (line: string) => void;
+  /** Stops the loop; a call in hand is still answered. */
+  signal?: AbortSignal;
+  /** Test seams. */
+  sleep?: (ms: number) => Promise<void>;
+  now?: () => number;
+  onPoll?: () => void;
+}
+
+export type SessionEndReason =
+  /** Peeps ended the session (410). */
+  | "session_over"
+  /** The session's `expiresAt` passed. */
+  | "expired"
+  /** 8 consecutive transport errors. */
+  | "lost_contact"
+  /** The caller's signal aborted (Ctrl-C). */
+  | "stopped";
+
+export interface SessionEnd {
+  reason: SessionEndReason;
+  handled: number;
+}
+
+/** Peeps refused this runner; retrying will not help. */
+export class BridgeRefusedError extends Error {
+  constructor(
+    readonly status: number,
+    readonly code: string,
+    message: string,
+  ) {
+    super(message);
+    this.name = "BridgeRefusedError";
+  }
+}
+
+export const LONG_POLL_SECONDS = 25;
+export const MAX_TRANSPORT_ERRORS = 8;
+/** The result route's own limit on `error`. */
+const MAX_ERROR_CHARS = 4000;
+const RESULT_ATTEMPTS = 3;
+
+class SessionOver extends Error {}
+class Stopped extends Error {}
+
+interface Answer {
+  status: number;
+  body: unknown;
+}
+
+const backoffMs = (consecutiveErrors: number) => 2000 * consecutiveErrors;
+
+const defaultSleep = (ms: number, signal?: AbortSignal) =>
+  new Promise<void>((resolve) => {
+    const timer = setTimeout(resolve, ms);
+    signal?.addEventListener(
+      "abort",
+      () => {
+        clearTimeout(timer);
+        resolve();
+      },
+      { once: true },
+    );
+  });
+
+export async function runBridgeSession(options: BridgeSessionOptions): Promise<SessionEnd> {
+  const { signal, log } = options;
+  const now = options.now ?? Date.now;
+  const sleep = options.sleep ?? ((ms: number) => defaultSleep(ms, signal));
+  const base = options.server.replace(/\/+$/, "");
+  const sessionPath = `/api/v1/bridge/sessions/${encodeURIComponent(options.sessionId)}`;
+  let handled = 0;
+  let transportErrors = 0;
+
+  /**
+   * One request. Answers the response, or null for a transport error (no
+   * answer, or a 5xx/429 from something between us and Peeps).
+   */
+  const request = async (
+    method: "GET" | "POST",
+    path: string,
+    body: unknown,
+    abortable: boolean,
+  ): Promise<Answer | null> => {
+    try {
+      const response = await fetch(base + path, {
+        method,
+        headers: {
+          ...options.headers,
+          authorization: await options.authorization(),
+          ...(body === undefined ? {} : { "content-type": "application/json" }),
+        },
+        body: body === undefined ? undefined : JSON.stringify(body),
+        signal: abortable ? signal : undefined,
+      });
+      const text = await response.text();
+      if (response.status >= 500 || response.status === 429) return null;
+      let parsed: unknown = null;
+      try {
+        parsed = text ? JSON.parse(text) : null;
+      } catch {
+        parsed = null;
+      }
+      return { status: response.status, body: parsed };
+    } catch (error) {
+      if (abortable && signal?.aborted) throw new Stopped();
+      void error;
+      return null;
+    }
+  };
+
+  /** A transport error: count it, back off, or give up. */
+  const transportError = async (what: string): Promise<boolean> => {
+    transportErrors += 1;
+    if (transportErrors >= MAX_TRANSPORT_ERRORS) {
+      log(`lost contact with Peeps after ${transportErrors} failed attempts in a row; leaving`);
+      return false;
+    }
+    log(`${what} failed (${transportErrors}/${MAX_TRANSPORT_ERRORS}); retrying`);
+    await sleep(backoffMs(transportErrors));
+    return true;
+  };
+
+  /** A non-2xx answer that is not a transport error. */
+  const refusal = (answer: Answer): never => {
+    if (answer.status === 410) throw new SessionOver();
+    throw refusalError(answer);
+  };
+
+  try {
+    if (signal?.aborted) throw new Stopped();
+
+    // Attach.
+    let attached: { kind?: string; expiresAt?: string } | null = null;
+    while (!attached) {
+      const answer = await request("POST", `${sessionPath}/attach`, { tools: options.tools, runnerInfo: options.runnerInfo }, true);
+      if (!answer) {
+        if (!(await transportError("attach"))) return { reason: "lost_contact", handled };
+        continue;
+      }
+      if (answer.status !== 200) refusal(answer);
+      attached = (answer.body ?? {}) as { kind?: string; expiresAt?: string };
+    }
+    transportErrors = 0;
+    const expiresAt = attached.expiresAt ? Date.parse(attached.expiresAt) : Number.POSITIVE_INFINITY;
+    log(`attached to session ${options.sessionId} (${attached.kind ?? "unknown kind"}); it expires at ${attached.expiresAt ?? "an unknown time"}`);
+
+    for (;;) {
+      if (signal?.aborted) throw new Stopped();
+      if (now() >= expiresAt) {
+        log("the session's time is up; leaving");
+        return { reason: "expired", handled };
+      }
+      options.onPoll?.();
+      const answer = await request("GET", `${sessionPath}/calls?wait=${LONG_POLL_SECONDS}`, undefined, true);
+      if (!answer) {
+        if (!(await transportError("poll"))) return { reason: "lost_contact", handled };
+        continue;
+      }
+      transportErrors = 0;
+      if (answer.status === 204) continue;
+      if (answer.status !== 200) refusal(answer);
+      const call = (answer.body as { call?: BridgeCall } | null)?.call;
+      if (!call) continue;
+
+      let outcome: CallOutcome;
+      try {
+        outcome = await options.handle(call);
+      } catch (error) {
+        outcome = { ok: false, error: error instanceof Error ? error.message : String(error) };
+      }
+      if (!outcome.ok) outcome = { ok: false, error: outcome.error.slice(0, MAX_ERROR_CHARS) };
+      handled += 1;
+
+      // Not abortable: a call in hand is answered even while stopping.
+      for (let attempt = 1; ; attempt++) {
+        const posted = await request("POST", `${sessionPath}/calls/${encodeURIComponent(call.id)}/result`, outcome, false);
+        if (posted) {
+          if (posted.status !== 200) refusal(posted);
+          break;
+        }
+        if (attempt >= RESULT_ATTEMPTS) {
+          log(`could not deliver the result of #${call.seq} after ${attempt} attempts`);
+          break;
+        }
+        await sleep(backoffMs(attempt));
+      }
+    }
+  } catch (error) {
+    if (error instanceof SessionOver) {
+      log(`Peeps ended the session after ${handled} call(s)`);
+      return { reason: "session_over", handled };
+    }
+    if (error instanceof Stopped) return { reason: "stopped", handled };
+    throw error;
+  }
+}
+
+function refusalError(answer: Answer): BridgeRefusedError {
+  const body = (answer.body ?? {}) as { error?: unknown; message?: unknown; next?: unknown };
+  const code = typeof body.error === "string" ? body.error : `http_${answer.status}`;
+  const message = REFUSAL_COPY[code]?.(body) ?? `Peeps refused this runner (${answer.status} ${code}).`;
+  return new BridgeRefusedError(answer.status, code, message);
+}
+
+const REFUSAL_COPY: Record<string, (body: { message?: unknown; next?: unknown }) => string> = {
+  invalid_token: () =>
+    "Peeps did not accept PEEPS_RUNNER_GRANT for this session. The grant may be mistyped or for another session, " +
+    "or the person who started it can no longer run it (connection revoked, role changed, or local discovery turned off). " +
+    "Ask your coding agent to run start_local_discovery again and use the command and grant it returns.",
+  invalid_runner_instance: () => "Peeps refused this runner's instance id. This is a bug in the runner; please report it.",
+  not_found: () => "Peeps has no such session. Check --session against what start_local_discovery returned.",
+  other_runner: () =>
+    "Another runner is already serving this session, and a session is served by one runner process only, " +
+    "so a runner that was stopped or restarted cannot take it back. " +
+    "Ask your coding agent to run start_local_discovery again for a fresh session and command.",
+  other_job: () => "Another CI job is already serving this session.",
+  playwright_mcp_version: (body) =>
+    [typeof body.message === "string" ? body.message : "This runner's @playwright/mcp version is not the one Peeps needs.", typeof body.next === "string" ? body.next : ""]
+      .filter(Boolean)
+      .join(" "),
+};
