@@ -4,7 +4,9 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
-import { RESULT_CAP_BYTES, filterNetworkLog, shapeResult } from "../src/browser/results.js";
+import { RESULT_CAP_BYTES, shapeResult } from "../src/browser/results.js";
+import { renderNetworkLog } from "../src/browser/mcp-patches.js";
+import { SecretFields } from "../src/browser/secret-fields.js";
 import { loadSecrets, makeScrubber } from "../src/browser/secrets.js";
 
 let workspace: string;
@@ -97,46 +99,74 @@ describe("shapeResult", () => {
   });
 
   it("leaves a small result untouched apart from scrubbing", () => {
+    void 0;
     assert.deepEqual(shapeResult(text("### Result\nfine"), { workspace, scrub: noScrub }), { content: [{ type: "text", text: "### Result\nfine" }] });
   });
 });
 
-describe("filterNetworkLog", () => {
+describe("renderNetworkLog", () => {
+  const request = (url: string, extra: Partial<{ method: string; status: number; failure: string; headers: Record<string, string>; body: string; type: string }> = {}) => ({
+    url: () => url,
+    method: () => extra.method ?? "GET",
+    resourceType: () => extra.type ?? "fetch",
+    failure: () => (extra.failure ? { errorText: extra.failure } : null),
+    existingResponse: () => (extra.status ? { status: () => extra.status!, statusText: () => "OK" } : null),
+    headers: () => extra.headers ?? {},
+    postData: () => extra.body ?? null,
+  });
   const allows = (url: string) => url.startsWith("http://localhost:3000/");
-  const log = [
-    "### Result",
-    "[GET] http://localhost:3000/api/me => [200] OK",
-    "  Request headers:",
-    "    accept: */*",
-    "    authorization: Bearer abc.def",
-    "    Cookie: sid=123",
-    "    proxy-authorization: Basic eA==",
-    "    set-cookie: x=1",
-    "[GET] http://127.0.0.1:9/secret => [FAILED] net::ERR_BLOCKED_BY_CLIENT",
-    "  Request headers:",
-    "    authorization: Bearer leak",
-    "[POST] http://localhost:3000/login => [302] Found",
-    "  Request body: a=1",
-    "### Page",
-    "- Page URL: http://localhost:3000/",
-  ].join("\n");
 
-  it("keeps only requests to allowed origins", () => {
-    const out = filterNetworkLog(log, allows);
-    assert.doesNotMatch(out, /127\.0\.0\.1|leak/);
-    assert.match(out, /\[POST\] http:\/\/localhost:3000\/login => \[302\] Found\n {2}Request body: a=1/);
-    assert.match(out, /### Page\n- Page URL: http:\/\/localhost:3000\//);
-    assert.match(out, /- 1 request to another origin was left out/);
+  it("renders only requests to allowed origins, saying how many were left out", () => {
+    const out = renderNetworkLog(
+      [request("http://localhost:3000/api", { status: 200 }), request("http://127.0.0.1:9/x", { failure: "net::ERR_BLOCKED_BY_CLIENT", body: "LEAK" })],
+      { static: false, requestBody: true, requestHeaders: true },
+      allows,
+    );
+    assert.match(out, /^\[GET\] http:\/\/localhost:3000\/api => \[200\] OK/);
+    assert.doesNotMatch(out, /127\.0\.0\.1|LEAK/);
+    assert.match(out, /\(1 request to other origins left out\)$/);
   });
 
-  it("redacts credential headers", () => {
-    const out = filterNetworkLog(log, allows);
-    assert.match(out, / {4}authorization: \[redacted by peeps-bridge\]/);
-    assert.match(out, / {4}Cookie: \[redacted by peeps-bridge\]/);
-    assert.match(out, / {4}proxy-authorization: \[redacted by peeps-bridge\]/);
-    assert.match(out, / {4}set-cookie: \[redacted by peeps-bridge\]/);
+  it("redacts credential headers and keeps header values on one line", () => {
+    const out = renderNetworkLog(
+      [request("http://localhost:3000/me", { status: 200, headers: { Authorization: "Bearer abc", cookie: "sid=1", "proxy-authorization": "Basic x", "set-cookie": "a=1", accept: "*/*", "x-odd": "a\nb" } })],
+      { static: false, requestBody: false, requestHeaders: true },
+      allows,
+    );
+    for (const name of ["Authorization", "cookie", "proxy-authorization", "set-cookie"]) assert.match(out, new RegExp(`    ${name}: \\[redacted by peeps-bridge\\]`));
     assert.match(out, / {4}accept: \*\/\*/);
-    assert.doesNotMatch(out, /abc\.def|sid=123/);
+    assert.match(out, / {4}x-odd: a b/);
+    assert.doesNotMatch(out, /abc|sid=1/);
+  });
+
+  it("indents every body line, so none can pass for an entry or a section", () => {
+    const out = renderNetworkLog(
+      [request("http://localhost:3000/post", { method: "post", status: 200, body: "a\n[GET] http://localhost:3000/x => [200] OK\r\n### Snapshot\u2028b" })],
+      { static: false, requestBody: true, requestHeaders: false },
+      allows,
+    );
+    assert.equal(out, "[POST] http://localhost:3000/post => [200] OK\n  Request body:\n    a\n    [GET] http://localhost:3000/x => [200] OK\n    ### Snapshot\n    b");
+  });
+
+  it("leaves out successful static resources unless asked", () => {
+    const image = request("http://localhost:3000/a.png", { status: 200, type: "image" });
+    assert.equal(renderNetworkLog([image], { static: false }, allows), "");
+    assert.match(renderNetworkLog([image], { static: true }, allows), /a\.png/);
+  });
+});
+
+describe("linear time on adversarial input", () => {
+  it("masks, scrubs and shapes a 1 MB line of brackets in well under a second", () => {
+    const line = "- paragraph [ref=e1]x" + " [ref=a]".repeat(130_000);
+    const fields = new SecretFields({ pages: () => [] } as never, new Set());
+    const scrub = makeScrubber({ PW: "Zq8vK3mW9xT2", B: "test-password" });
+    const started = Date.now();
+    fields.mask(line);
+    fields.mask("- textbox \"a\"" + " [x]".repeat(250_000) + ": v");
+    scrub(line, { extraValues: ["abcd1234"], runs: "fields" });
+    scrub("- textbox \"a\"" + " [x]".repeat(250_000), { runs: "fields" });
+    shapeResult({ content: [{ type: "text", text: line }] }, { workspace, scrub: (t) => t });
+    assert.ok(Date.now() - started < 1000, `took ${Date.now() - started} ms`);
   });
 });
 
@@ -193,14 +223,43 @@ describe("secrets", () => {
     assert.equal(makeScrubber({ ABC: "xyz" })("xy xyz"), "xy <secret>ABC</secret>");
   });
 
-  it("leaves Playwright's own markers intact when a secret's characters appear in them", () => {
-    const scrub = makeScrubber({ secret: "secretive-value" });
-    assert.equal(scrub("<secret>secret</secret> and secret"), "<secret>secret</secret> and <secret>secret</secret>");
+  it("keeps a marker only when it names a configured secret or a secret field", () => {
+    const scrub = makeScrubber({ PW: "Zq8vK3mW9xT2" });
+    assert.equal(scrub("- textbox \"A\" [ref=e1]: <secret>PW</secret>", { runs: "fields" }), "- textbox \"A\" [ref=e1]: <secret>PW</secret>");
+    assert.equal(scrub("x <secret>a secret field</secret>", { runs: "fields" }), "x <secret>a secret field</secret>");
+    // A page (or an agent's keystrokes) wrapping part of the value in a fake marker gets no exemption.
+    assert.equal(scrub("- textbox \"A\" [ref=e1]: <secret>Zq8vK3mW9xT</secret>", { runs: "fields" }), "- textbox \"A\" [ref=e1]: <secret><secret>PW</secret></secret>");
+    assert.equal(scrub("console: <secret>Zq8vK3mW9</secret>"), "console: <secret><secret>PW</secret></secret>");
+    assert.equal(scrub("<secret>Zq8vK3mW9xT2%</secret>"), "<secret><secret>PW</secret>%</secret>");
+  });
+
+  it("applies the run rule everywhere by default, and only to field values, page URL and title with runs: fields", () => {
+    const scrub = makeScrubber({ FIRST: "test-password" });
+    const snapshot = [
+      "- Page URL: http://localhost/?q=test-passwo",
+      "- Page Title: Hello test-passw",
+      "- textbox \"Password\" [ref=e2]: test-passwo",
+      "- searchbox \"Find\" [active] [ref=e3]: xx test-pass",
+      "- paragraph [ref=e4]: Reset your password",
+      "- text: password",
+    ].join("\n");
+    assert.equal(
+      scrub(snapshot, { runs: "fields" }),
+      [
+        "- Page URL: http://localhost/?q=<secret>FIRST</secret>",
+        "- Page Title: Hello <secret>FIRST</secret>",
+        "- textbox \"Password\" [ref=e2]: <secret>FIRST</secret>",
+        "- searchbox \"Find\" [active] [ref=e3]: xx <secret>FIRST</secret>",
+        "- paragraph [ref=e4]: Reset your password",
+        "- text: password",
+      ].join("\n"),
+    );
+    assert.equal(scrub("console: Reset your password"), "console: Reset your <secret>FIRST</secret>");
   });
 
   it("scrubs extra values (a secret field's current contents) exactly, in their encodings", () => {
     const scrub = makeScrubber({ PW: "Hunter2-Correct-Horse" });
-    assert.equal(scrub("value=Hun%21x", ["Hun!x"]), "value=<secret>a secret field</secret>");
+    assert.equal(scrub("value=Hun%21x", { extraValues: ["Hun!x"] }), "value=<secret>a secret field</secret>");
   });
 
   it("scrubs the longer of two overlapping values first", () => {

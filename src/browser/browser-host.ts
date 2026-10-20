@@ -24,7 +24,8 @@ import { chromium, type Browser, type BrowserContext } from "playwright-core";
 import { McpLink, type McpServerLike } from "./mcp-link.js";
 import { OriginPolicy } from "./origin-policy.js";
 import { startOriginProxy, type OriginProxy } from "./origin-proxy.js";
-import { filterNetworkLog, shapeResult, type TextResult } from "./results.js";
+import { registerSession } from "./mcp-patches.js";
+import { shapeResult, type TextResult } from "./results.js";
 import { SecretFields } from "./secret-fields.js";
 import { longestFirst, makeScrubber, type Secrets } from "./secrets.js";
 
@@ -53,33 +54,31 @@ export interface BrowserHost {
   /** Run one already-allowed tool call and shape its result for Peeps. */
   callTool(name: string, args: Record<string, unknown>): Promise<TextResult>;
   scrub(text: string): string;
+  /**
+   * What `close()` would remove, for a synchronous last-resort cleanup (a
+   * forced exit, the watchdog): the scratch directory and the Chromium
+   * profile directory Playwright made for this browser.
+   */
+  scratchPaths(): string[];
   close(): Promise<void>;
 }
+
+const PROFILE_PREFIX = "playwright_chromiumdev_profile-";
+const profileDirs = () => {
+  try {
+    return new Set(fs.readdirSync(os.tmpdir()).filter((name) => name.startsWith(PROFILE_PREFIX)));
+  } catch {
+    return new Set<string>();
+  }
+};
+
+const EVERYWHERE = new Set(["browser_console_messages", "browser_network_requests"]);
 
 const SERVICE_WORKER_BLOCK = `(() => {
   if (typeof ServiceWorkerContainer === "undefined") return;
   const refuse = () => Promise.reject(new DOMException("Service workers are blocked by peeps-bridge", "SecurityError"));
   Object.defineProperty(ServiceWorkerContainer.prototype, "register", { value: refuse, writable: false, configurable: false });
 })();`;
-
-/**
- * Downloads are refused (`acceptDownloads: false`), but Playwright still
- * emits the event, and `@playwright/mcp`'s tab answers it with an unawaited
- * `download.saveAs()` that then rejects: an unhandled rejection that kills
- * this process. Replace that handler with one that cancels the download and
- * tells the session's host, which says so in the next result.
- */
-const downloadRefused = new WeakMap<BrowserContext, (name: string) => void>();
-let downloadsPatched = false;
-function refuseDownloads(): void {
-  if (downloadsPatched) return;
-  downloadsPatched = true;
-  const { Tab } = require("playwright-core/lib/tools/exports") as { Tab: { prototype: Record<string, unknown> } };
-  Tab.prototype._downloadStarted = async function (download: { suggestedFilename(): string; cancel(): Promise<void>; page(): { context(): BrowserContext } }) {
-    await download.cancel().catch(() => {});
-    downloadRefused.get(download.page().context())?.(download.suggestedFilename());
-  };
-}
 
 type CreateConnection = (config: object, contextGetter: () => Promise<BrowserContext>) => Promise<McpServerLike>;
 
@@ -90,7 +89,8 @@ export async function startBrowserHost(options: BrowserHostOptions): Promise<Bro
   const blocked: string[] = [];
   const notes: string[] = [];
   let fields: SecretFields | null = null;
-  const scrub = (text: string) => scrubSecrets(text, fields?.scrubbable() ?? []);
+  const scrub = (text: string) => scrubSecrets(text, { extraValues: fields?.scrubbable() ?? [] });
+  const scratch = [workspace];
   const cleanups: (() => Promise<unknown> | unknown)[] = [() => fs.rmSync(workspace, { recursive: true, force: true })];
   const cleanup = async () => {
     for (const step of cleanups.reverse()) {
@@ -114,6 +114,7 @@ export async function startBrowserHost(options: BrowserHostOptions): Promise<Bro
         // close); Playwright's own handler would kill the browser at once.
         handleSIGINT: false,
         handleSIGTERM: false,
+        handleSIGHUP: false,
         // Loopback through the proxy too: the target is usually localhost, and
         // so is much of what the policy must keep the browser away from.
         proxy: { server: proxy.url, bypass: "<-loopback>" },
@@ -131,6 +132,7 @@ export async function startBrowserHost(options: BrowserHostOptions): Promise<Bro
     // by default). Some Linux setups forbid the user namespaces it needs.
     let sandboxed = true;
     let browser: Browser;
+    const profilesBefore = profileDirs();
     try {
       browser = await launch(true);
     } catch (error) {
@@ -140,6 +142,7 @@ export async function startBrowserHost(options: BrowserHostOptions): Promise<Bro
       browser = await launch(false);
     }
     cleanups.push(() => browser.close());
+    for (const name of profileDirs()) if (!profilesBefore.has(name)) scratch.push(path.join(os.tmpdir(), name));
 
     const context = await browser.newContext({
       viewport: VIEWPORT,
@@ -151,8 +154,11 @@ export async function startBrowserHost(options: BrowserHostOptions): Promise<Bro
     // `navigator.serviceWorker` instance, which a page bypasses through
     // `ServiceWorkerContainer.prototype.register` (tested). Refuse there too.
     await context.addInitScript(SERVICE_WORKER_BLOCK);
-    refuseDownloads();
-    downloadRefused.set(context, (name) => notes.push(`The runner refused a download (${name}): downloads are blocked in local discovery.`));
+    // Before createConnection: the network tool is replaced as it is created.
+    registerSession(context, {
+      allowsUrl: (url) => policy.allowsUrl(url),
+      onDownloadRefused: (name) => notes.push(`The runner refused a download (${name}): downloads are blocked in local discovery.`),
+    });
     fields = new SecretFields(context, new Set(Object.keys(options.secrets)));
     // The fast first check, with a clear refusal; the proxy is the real one
     // (this does not see redirects).
@@ -185,22 +191,34 @@ export async function startBrowserHost(options: BrowserHostOptions): Promise<Bro
       browser,
       sandboxed,
       scrub,
-      async callTool(name, args) {
+      scratchPaths: () => [...scratch],
+      async callTool(name, rawArgs) {
         blocked.length = 0;
         const tracked = fields!;
+        let args = rawArgs;
+        if (name === "browser_type" && args.slowly && tracked.secretRefs(name, args).length > 0) {
+          // One fill: typed one character at a time, a page sees (and can log)
+          // every prefix of the secret.
+          const { slowly: _slowly, ...rest } = args;
+          args = rest;
+        }
+        if (name === "browser_drag" && (await tracked.isSensitive(String(args.startRef)))) {
+          return {
+            content: [{ type: "text", text: "browser_drag was refused by the runner: dragging from a field holding a secret or a password could move its text where it is not hidden." }],
+            isError: true,
+          };
+        }
         await tracked.before(name, args);
         const raw = await link.callTool(name, args);
         await tracked.refresh();
         const refused = notes.splice(0);
+        const runs = EVERYWHERE.has(name) ? "everywhere" : "fields";
         return shapeResult(raw, {
           workspace,
-          scrub,
+          scrub: (text) => scrubSecrets(text, { extraValues: tracked.scrubbable(), runs }),
           blocked: [...blocked],
           notes: refused,
-          transform: (text) => {
-            const masked = tracked.mask(text);
-            return name === "browser_network_requests" ? filterNetworkLog(masked, (url) => policy.allowsUrl(url)) : masked;
-          },
+          transform: (text) => tracked.mask(text),
         });
       },
       close() {

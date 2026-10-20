@@ -71,6 +71,25 @@ describe("the tool allowlist", () => {
     );
   });
 
+  it("refuses selector on browser_fill_form fields: playwright-core prefers it to ref, which would bypass secret-field tracking", () => {
+    assert.match(
+      refuseCall("browser_fill_form", { fields: [{ name: "Notes", type: "textbox", ref: "e999", selector: "#notes", value: "PW" }] }) ?? "",
+      /fields\[0\] does not take selector/,
+    );
+  });
+
+  for (const key of ["Control+c", "Control+C", "control+x", "Meta+v", "ControlOrMeta+c", "ControlOrMeta+KeyV", "Control+Shift+c", "Control+Insert", "Shift+Insert", "Shift+Delete", "Copy", "Cut", "Paste"]) {
+    it(`refuses the clipboard key ${key}`, () => {
+      assert.match(refuseCall("browser_press_key", { key }) ?? "", /clipboard/);
+    });
+  }
+
+  for (const key of ["c", "C", "Control+a", "Shift+C", "Insert", "Delete", "Enter", "ArrowLeft", "Control+Enter", "+"]) {
+    it(`allows the key ${key}`, () => {
+      assert.equal(refuseCall("browser_press_key", { key }), null);
+    });
+  }
+
   it("refuses _meta, which playwright-core reads as a per-call working directory", () => {
     assert.match(refuseCall("browser_snapshot", { _meta: { cwd: "/" } }) ?? "", /does not take _meta/);
   });
@@ -123,6 +142,12 @@ describe("the catalogue against the installed @playwright/mcp", () => {
       delete upstreamProperties.filename;
       // `filter` is compiled with `new RegExp` on the runner's event loop: dropped.
       if (tool.name === "browser_network_requests") delete upstreamProperties.filter;
+      // fields[].selector beats ref in playwright-core: dropped.
+      if (tool.name === "browser_fill_form") {
+        const fields = structuredClone(upstreamProperties.fields) as { items: { properties: Record<string, unknown>; required?: string[] } };
+        delete fields.items.properties.selector;
+        upstreamProperties.fields = fields;
+      }
       assert.deepEqual(
         JSON.parse(JSON.stringify(tool.inputSchema.properties)),
         JSON.parse(JSON.stringify(upstreamProperties)),

@@ -16,6 +16,9 @@ export function refuseCall(tool: string, args: Record<string, unknown>): string 
   if (!definition) return `${tool} is not available on this runner.`;
   const problem = check(definition.inputSchema, args, "arguments");
   if (problem) return `${tool} was refused by the runner: ${problem}.`;
+  if (tool === "browser_press_key" && isClipboardKey(String(args.key))) {
+    return "browser_press_key was refused by the runner: clipboard keys (copy, cut, paste) are not available, so a field's text cannot be moved to where it is not hidden.";
+  }
   if (tool === "browser_navigate" && !isWebUrl(args.url)) {
     return "browser_navigate only opens http:// and https:// URLs; give the full URL.";
   }
@@ -72,4 +75,22 @@ function check(schema: JsonSchema, value: unknown, path: string): string | null 
     default:
       return `${path} has a schema this runner does not understand`;
   }
+}
+
+const COMMAND_MODIFIERS = new Set(["control", "ctrl", "meta", "cmd", "command", "controlormeta", "os"]);
+const CLIPBOARD_KEYS = new Set(["copy", "cut", "paste"]);
+
+/**
+ * Copy, cut or paste in any spelling Playwright accepts: Control/Meta (or
+ * ControlOrMeta) with C, X, V or Insert, Shift with Insert or Delete, and the
+ * Copy, Cut and Paste keys themselves.
+ */
+export function isClipboardKey(key: string): boolean {
+  const parts = key.length > 1 && key.endsWith("++") ? [...key.slice(0, -2).split("+"), "+"] : key.split("+");
+  const main = (parts.pop() ?? "").toLowerCase().replace(/^key([a-z])$/, "$1");
+  const modifiers = new Set(parts.map((part) => part.toLowerCase()));
+  if (CLIPBOARD_KEYS.has(main)) return true;
+  const command = [...modifiers].some((m) => COMMAND_MODIFIERS.has(m));
+  if (command && ["c", "x", "v", "insert"].includes(main)) return true;
+  return modifiers.has("shift") && (main === "insert" || main === "delete");
 }

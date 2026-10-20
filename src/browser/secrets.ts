@@ -12,12 +12,18 @@
  * - the value in each form below (plain, URL, form, JSON, HTML, entities);
  * - any run of consecutive characters of a secret at least `runLength` long
  *   (6, or half a short secret, never under 3), so a truncated or edited
- *   value is caught wherever it appears;
+ *   value is caught. Where depends on `runs`: everywhere (console and network
+ *   output, printed lines), or with `"fields"` only in the places a typed
+ *   value shows up in a snapshot: the value of an editable field's line
+ *   (textbox, searchbox, combobox, spinbutton) and the Page URL and Page
+ *   Title lines. Not in accessible names, headings or other page text, where
+ *   it hid ordinary words ("Password" for a secret containing "password");
  * - extra values the caller passes: the current contents of fields that were
  *   filled from a secret, and of password fields (`secret-fields.ts`).
  *
- * The run rule also redacts ordinary text that happens to share 6 characters
- * with a secret. That is the price of catching partial values.
+ * A `<secret>X</secret>` marker is kept as it is only when X is a configured
+ * name or the field label; anything else between the tags (a page, or the
+ * agent's keystrokes, wrapping part of a value) is scrubbed like any text.
  */
 
 const SPEC = /^([A-Za-z_][A-Za-z0-9_]*)=([A-Za-z_][A-Za-z0-9_]*)$/;
@@ -88,14 +94,25 @@ export function runLength(secret: string): number | null {
 // inside one.
 const token = (n: number) => `${[...n.toString(16)].map((d) => String.fromCharCode(0xe010 + parseInt(d, 16))).join("")}`;
 const TOKEN = /([-]+)/g;
-const MARKER = /<secret>[^<>\n]{1,100}<\/secret>/g;
+const MARKER = /<secret>([^<>\n]{1,100})<\/secret>/g;
+const PAGE_LINE = /^(\s*- Page (?:URL|Title): )(.*)$/;
+// Linear: a literal role, an optional quoted name, then bracketed attributes.
+const EDITABLE_LINE = /^(\s*- (?:textbox|searchbox|combobox|spinbutton)(?: "(?:[^"\\]|\\.)*")?(?: \[[^\]\n]*\])*: )(.*)$/;
+
+export interface ScrubOptions {
+  /** Further values to remove exactly (secret and password fields' contents). */
+  extraValues?: readonly string[];
+  /** Where the run rule applies; everywhere by default. */
+  runs?: "everywhere" | "fields";
+}
 
 /**
  * A function that replaces every secret value (and every extra value) with
  * `<secret>NAME</secret>`.
  */
-export function makeScrubber(secrets: Secrets): (text: string, extraValues?: readonly string[]) => string {
+export function makeScrubber(secrets: Secrets): (text: string, options?: ScrubOptions) => string {
   const entries = Object.entries(secrets);
+  const names = new Set([...Object.keys(secrets), FIELD_LABEL]);
   const pairs = entries.flatMap(([name, value]) => variants(value).map((form) => [form, `<secret>${name}</secret>`] as const));
   const runs = entries.flatMap(([name, value]) => {
     const k = runLength(value);
@@ -105,7 +122,7 @@ export function makeScrubber(secrets: Secrets): (text: string, extraValues?: rea
     return [{ name, k, grams }];
   });
 
-  return (text, extraValues = []) => {
+  return (text, { extraValues = [], runs: scope = "everywhere" } = {}) => {
     const all = [...pairs, ...extraValues.flatMap((value) => variants(value).map((form) => [form, `<secret>${FIELD_LABEL}</secret>`] as const))].sort(
       (a, b) => b[0].length - a[0].length,
     );
@@ -115,12 +132,28 @@ export function makeScrubber(secrets: Secrets): (text: string, extraValues?: rea
       saved.push(replacement);
       return token(saved.length - 1);
     };
-    // Markers already in the text (Playwright's own) are kept as they are.
-    let out = text.replace(MARKER, (marker) => keep(marker));
+    // Playwright's own markers are kept; a marker around anything but a
+    // configured name is ordinary text.
+    let out = text.replace(MARKER, (marker, inner: string) => (names.has(inner) ? keep(marker) : marker));
     for (const [form, replacement] of all) {
       if (out.includes(form)) out = out.split(form).join(keep(replacement));
     }
-    for (const { name, k, grams } of runs) out = redactRuns(out, k, grams, () => keep(`<secret>${name}</secret>`));
+    const applyRuns = (part: string) => {
+      for (const { name, k, grams } of runs) part = redactRuns(part, k, grams, () => keep(`<secret>${name}</secret>`));
+      return part;
+    };
+    if (runs.length > 0) {
+      out =
+        scope === "everywhere"
+          ? applyRuns(out)
+          : out
+              .split("\n")
+              .map((line) => {
+                const match = PAGE_LINE.exec(line) ?? EDITABLE_LINE.exec(line);
+                return match ? match[1]! + applyRuns(match[2]!) : line;
+              })
+              .join("\n");
+    }
     return out.replace(TOKEN, (_t, digits: string) => saved[parseInt([...digits].map((d) => (d.charCodeAt(0) - 0xe010).toString(16)).join(""), 16)]!);
   };
 }

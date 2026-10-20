@@ -26,14 +26,15 @@ export function createCallHandler(options: CallHandlerOptions): (call: BridgeCal
 
   return async (call) => {
     const args = call.args;
+    const seq = flat(call.seq);
     const refused = refuseCall(call.tool, args);
     if (refused) {
-      print(`#${call.seq} refused ${call.tool}`);
+      print(`#${seq} refused ${flat(call.tool)}`);
       return refusal(refused);
     }
     const action = describeAction(call.tool, args, secretNames);
     if (call.tool === "browser_navigate" && !policy.allowsUrl(String(args.url))) {
-      print(`#${call.seq} refused ${action}`);
+      print(`#${seq} refused ${action}`);
       return refusal(
         `browser_navigate refused: ${OriginPolicy.originOf(String(args.url))} is not an allowed origin for this session. ` +
           `Allowed: ${policy.origins.join(", ")}. The person running peeps-bridge can add one with --allow-origin.`,
@@ -42,10 +43,10 @@ export function createCallHandler(options: CallHandlerOptions): (call: BridgeCal
     try {
       const result = await host.callTool(call.tool, args);
       const where = pageLocation(result.content.map((p) => p.text).join("\n"), policy);
-      print(`#${call.seq} ${action}${where ? ` on ${where}` : ""}${result.isError ? " (failed)" : ""}`);
+      print(`#${seq} ${action}${where ? ` on ${where}` : ""}${result.isError ? " (failed)" : ""}`);
       return { ok: true, result };
     } catch (error) {
-      print(`#${call.seq} ${action} (failed)`);
+      print(`#${seq} ${action} (failed)`);
       return { ok: false, error: host.scrub(error instanceof Error ? error.message : String(error)) };
     }
   };
@@ -63,18 +64,21 @@ function pageLocation(text: string, policy: OriginPolicy): string | null {
   }
 }
 
+/** One line, whatever the agent sent: no forged `[peeps] …` lines. */
+const flat = (text: unknown) => String(text).replace(/[\r\n\u2028\u2029\u0085]+/g, " ");
+
 const quote = (text: unknown) => {
-  const s = String(text);
+  const s = flat(text);
   return `"${s.length > 40 ? `${s.slice(0, 40)}…` : s}"`;
 };
 
-const target = (element: unknown, ref: unknown) => (typeof element === "string" && element ? `'${element}'` : String(ref));
+const target = (element: unknown, ref: unknown) => (typeof element === "string" && element ? `'${flat(element)}'` : flat(ref));
 
 /** Plain words for one call, e.g. "click 'Place order'". */
 export function describeAction(tool: string, args: Record<string, unknown>, secretNames: ReadonlySet<string>): string {
   switch (tool) {
     case "browser_navigate":
-      return `navigate to ${String(args.url)}`;
+      return `navigate to ${flat(args.url)}`;
     case "browser_navigate_back":
       return "go back";
     case "browser_snapshot":
@@ -87,10 +91,10 @@ export function describeAction(tool: string, args: Record<string, unknown>, secr
     }
     case "browser_fill_form": {
       const fields = Array.isArray(args.fields) ? (args.fields as { name?: unknown }[]) : [];
-      return `fill ${fields.length} field${fields.length === 1 ? "" : "s"}: ${fields.map((f) => String(f.name)).join(", ")}`;
+      return `fill ${fields.length} field${fields.length === 1 ? "" : "s"}: ${fields.map((f) => flat(f.name)).join(", ")}`;
     }
     case "browser_press_key":
-      return `press ${String(args.key)}`;
+      return `press ${flat(args.key)}`;
     case "browser_select_option":
       return `select ${quote((args.values as unknown[]).join(", "))} in ${target(args.element, args.ref)}`;
     case "browser_hover":
@@ -100,16 +104,16 @@ export function describeAction(tool: string, args: Record<string, unknown>, secr
     case "browser_wait_for":
       if (typeof args.text === "string") return `wait for ${quote(args.text)}`;
       if (typeof args.textGone === "string") return `wait for ${quote(args.textGone)} to go`;
-      return `wait ${String(args.time)} s`;
+      return `wait ${flat(args.time)} s`;
     case "browser_handle_dialog":
       return args.accept ? "accept the dialog" : "dismiss the dialog";
     case "browser_tabs":
-      return args.action === "list" ? "list tabs" : args.action === "new" ? "open a tab" : `${String(args.action)} tab ${args.index ?? "(current)"}`;
+      return args.action === "list" ? "list tabs" : args.action === "new" ? "open a tab" : `${flat(args.action)} tab ${flat(args.index ?? "(current)")}`;
     case "browser_console_messages":
       return "read console messages";
     case "browser_network_requests":
       return "read network requests";
     default:
-      return tool;
+      return flat(tool);
   }
 }

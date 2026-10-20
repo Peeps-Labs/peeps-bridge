@@ -21,49 +21,12 @@ export interface ShapeOptions {
   /** The scratch directory the MCP server writes into. */
   workspace: string;
   scrub: (text: string) => string;
-  /** Applied to the text before scrubbing (secret-field masking, network filtering). */
+  /** Applied to the text before scrubbing (secret-field masking). */
   transform?: (text: string) => string;
   /** Origins the runner refused during this call. */
   blocked?: string[];
   /** Other things the runner refused (a download), one line each. */
   notes?: string[];
-}
-
-const REDACTED = "[redacted by peeps-bridge]";
-const CREDENTIAL_HEADERS = new Set(["authorization", "proxy-authorization", "cookie", "set-cookie"]);
-const REQUEST_LINE = /^\[[A-Z]+\] (\S+)/;
-
-/**
- * `browser_network_requests` output limited to the allowed origins (design
- * §7.1), with credential headers redacted. An entry starts at its
- * `[METHOD] url` line and runs to the next entry or section; a request to
- * any other origin (a refused one included) is left out whole.
- */
-export function filterNetworkLog(text: string, allowsUrl: (url: string) => boolean): string {
-  const out: string[] = [];
-  let keeping = true;
-  let dropped = 0;
-  let inNetwork = false;
-  for (const line of text.split("\n")) {
-    if (line.startsWith("### ")) {
-      if (inNetwork && dropped > 0) out.push(`- ${dropped} request${dropped === 1 ? "" : "s"} to another origin ${dropped === 1 ? "was" : "were"} left out`);
-      inNetwork = line === "### Result";
-      dropped = 0;
-      keeping = true;
-      out.push(line);
-      continue;
-    }
-    const request = inNetwork ? REQUEST_LINE.exec(line) : null;
-    if (request) {
-      keeping = allowsUrl(request[1]!);
-      if (!keeping) dropped += 1;
-    }
-    if (!keeping) continue;
-    const header = inNetwork ? /^( {4}([^:\s]+): ).*$/.exec(line) : null;
-    out.push(header && CREDENTIAL_HEADERS.has(header[2]!.toLowerCase()) ? `${header[1]}${REDACTED}` : line);
-  }
-  if (inNetwork && dropped > 0) out.push(`- ${dropped} request${dropped === 1 ? "" : "s"} to another origin ${dropped === 1 ? "was" : "were"} left out`);
-  return out.join("\n");
 }
 
 const SNAPSHOT_LINK = /^- \[Snapshot\]\(([^)\n]+)\)$/gm;

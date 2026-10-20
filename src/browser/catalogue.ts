@@ -15,7 +15,9 @@
  * playwright-core compiles it with `new RegExp` on this process's event loop,
  * so a catastrophic pattern would freeze the runner (and its Ctrl-C). Any
  * argument a schema does not declare is refused, which also refuses `_meta`
- * (playwright-core reads `_meta.cwd` as a per-call workspace).
+ * (playwright-core reads `_meta.cwd` as a per-call workspace). So is
+ * `browser_fill_form`'s `fields[].selector`: playwright-core prefers it to
+ * `ref`, so a field filled through it would escape secret-field tracking.
  *
  * A test compares these schemas with the installed package's own, so bumping
  * `@playwright/mcp` fails until this file and Peeps' copy are updated.
@@ -179,11 +181,6 @@ export const BROWSER_CATALOGUE: readonly BrowserToolDefinition[] =
                   type: "string",
                   description:
                     "Exact target field reference from the page snapshot",
-                },
-                selector: {
-                  description:
-                    'CSS or role selector for the field element, when "ref" is not available. Either "selector" or "ref" is required.',
-                  type: "string",
                 },
                 value: {
                   type: "string",
