@@ -5,7 +5,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
-import { stallDecision } from "../src/watchdog.js";
+import { killDescendants, stallDecision } from "../src/watchdog.js";
 
 function runChild(mode: "stall" | "healthy" | "chromium") {
   const scratch = path.join(fs.mkdtempSync(path.join(os.tmpdir(), "bridge-watchdog-")), "scratch");
@@ -46,6 +46,44 @@ describe("the event-loop watchdog", () => {
     assert.equal(result.code, 0, result.output);
     assert.match(result.output, /done/);
     fs.rmSync(path.dirname(result.scratch), { recursive: true, force: true });
+  });
+});
+
+describe("killDescendants", () => {
+  it("says so when it cannot list the runner's child processes", () => {
+    const reports: string[] = [];
+    const noPgrep = () => {
+      throw Object.assign(new Error("spawn pgrep ENOENT"), { code: "ENOENT" });
+    };
+    killDescendants(12345, noPgrep, (line) => reports.push(line));
+    assert.equal(reports.length, 1);
+    assert.match(reports[0]!, /could not list the browser's processes/);
+  });
+
+  it("is quiet when there are simply no children (pgrep exits 1)", () => {
+    const reports: string[] = [];
+    const none = () => {
+      throw Object.assign(new Error("Command failed: pgrep"), { status: 1 });
+    };
+    killDescendants(12345, none, (line) => reports.push(line));
+    assert.deepEqual(reports, []);
+  });
+
+  it("is reported by the watchdog when the kill fails, before it removes the scratch directory", async () => {
+    const scratch = path.join(fs.mkdtempSync(path.join(os.tmpdir(), "bridge-watchdog-")), "scratch");
+    const child = spawn(process.execPath, ["--import", "tsx", "test/fixtures/watchdog-child.ts", "stall", scratch], {
+      // No pgrep on this PATH: the kill cannot list processes.
+      env: { ...process.env, PATH: path.dirname(process.execPath) },
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    let output = "";
+    child.stdout.on("data", (c) => (output += c));
+    child.stderr.on("data", (c) => (output += c));
+    const signal = await new Promise((resolve) => child.on("exit", (_code, s) => resolve(s)));
+    assert.equal(signal, "SIGKILL", output);
+    assert.match(output, /could not list the browser's processes/);
+    assert.equal(fs.existsSync(scratch), false);
+    fs.rmSync(path.dirname(scratch), { recursive: true, force: true });
   });
 });
 

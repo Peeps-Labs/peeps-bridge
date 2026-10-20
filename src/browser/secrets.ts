@@ -26,6 +26,8 @@
  * agent's keystrokes, wrapping part of a value) is scrubbed like any text.
  */
 
+import { parseLine } from "./snapshot-lines.js";
+
 const SPEC = /^([A-Za-z_][A-Za-z0-9_]*)=([A-Za-z_][A-Za-z0-9_]*)$/;
 
 export type Secrets = Record<string, string>;
@@ -57,25 +59,37 @@ export function longestFirst(secrets: Secrets): Secrets {
 }
 
 const html = (text: string) => text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;").replace(/'/g, "&#39;");
+const hex4 = (unit: number, upper: boolean) => (upper ? unit.toString(16).padStart(4, "0").toUpperCase() : unit.toString(16).padStart(4, "0"));
 const codeUnits = (text: string) => Array.from({ length: text.length }, (_, i) => text.charCodeAt(i));
 const codePoints = (text: string) => [...text].map((c) => c.codePointAt(0)!);
 
 /** Every form a value is likely to appear in. */
 function variants(value: string): string[] {
-  const uri = encodeURIComponent(value);
+  // A lone surrogate (a field's contents cut mid-emoji) has no URI encoding:
+  // encodeURIComponent throws, so that form is skipped, never fatal.
+  let uri = "";
+  try {
+    uri = encodeURIComponent(value);
+  } catch {
+    uri = "";
+  }
   const form = new URLSearchParams({ v: value }).toString().slice(2);
   const json = JSON.stringify(value).slice(1, -1);
   const escaped = html(value);
+  const ascii = (upper: boolean) => json.replace(/[\u007f-\uffff]/g, (c) => `\\u${hex4(c.charCodeAt(0), upper)}`);
   const forms = new Set([
     value,
     uri,
     form,
     json,
+    // Python's json.dumps (ensure_ascii): only code units of 0x7f and up escaped.
+    ascii(false),
+    ascii(true),
     json.replace(/\//g, "\\/"),
     escaped,
     escaped.replace(/&#39;/g, "&#x27;"),
-    html(uri),
-    html(form),
+    uri ? html(uri) : "",
+    form ? html(form) : "",
     codePoints(value).map((c) => `&#${c};`).join(""),
     codePoints(value).map((c) => `&#x${c.toString(16)};`).join(""),
     codePoints(value).map((c) => `&#x${c.toString(16).toUpperCase()};`).join(""),
@@ -101,8 +115,14 @@ const MARKER = /<secret>([^<>\n]{1,100})<\/secret>/g;
 const PAGE_LINE = /^(\s*- Page (?:URL|Title): )(.*)$/;
 // `### Open tabs`: `- 1: (current) [Title](url)`, title and URL of every tab.
 const TAB_LINE = /^(- \d+:(?: \(current\))? )(.*)$/;
-// Linear: a literal role, an optional quoted name, then bracketed attributes.
-const EDITABLE_LINE = /^(\s*- (?:textbox|searchbox|combobox|spinbutton)(?: "(?:[^"\\]|\\.)*")?(?: \[[^\]\n]*\])*: )(.*)$/;
+const EDITABLE_ROLES = new Set(["textbox", "searchbox", "combobox", "spinbutton"]);
+
+/** An editable field's line split before its value, quoted keys included. */
+function editableValue(line: string): [string, string] | null {
+  const p = parseLine(line);
+  if (!p?.role || !EDITABLE_ROLES.has(p.role) || p.rawValue === null) return null;
+  return [`${p.head}: `, p.rawValue];
+}
 
 export interface ScrubOptions {
   /** Further values to remove exactly (secret and password fields' contents). */
@@ -154,8 +174,9 @@ export function makeScrubber(secrets: Secrets): (text: string, options?: ScrubOp
           : out
               .split("\n")
               .map((line) => {
-                const match = PAGE_LINE.exec(line) ?? TAB_LINE.exec(line) ?? EDITABLE_LINE.exec(line);
-                return match ? match[1]! + applyRuns(match[2]!) : line;
+                const page = PAGE_LINE.exec(line) ?? TAB_LINE.exec(line);
+                const match: [string, string] | null = page ? [page[1]!, page[2]!] : editableValue(line);
+                return match ? match[0] + applyRuns(match[1]) : line;
               })
               .join("\n");
     }

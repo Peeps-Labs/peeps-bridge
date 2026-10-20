@@ -7,6 +7,9 @@ import path from "node:path";
 import { RESULT_CAP_BYTES, shapeResult } from "../src/browser/results.js";
 import { renderNetworkLog } from "../src/browser/mcp-patches.js";
 import { SecretFields } from "../src/browser/secret-fields.js";
+import { parseLine } from "../src/browser/snapshot-lines.js";
+
+const pick = (p: ReturnType<typeof parseLine>) => p && { indent: p.indent, role: p.role, name: p.name, ref: p.ref, value: p.value };
 import { loadSecrets, makeScrubber } from "../src/browser/secrets.js";
 
 let workspace: string;
@@ -171,6 +174,33 @@ describe("renderNetworkLog", () => {
   });
 });
 
+describe("snapshot lines with YAML-quoted keys", () => {
+  it("are parsed with their role, name, ref and value", () => {
+    assert.deepEqual(pick(parseLine(`    - 'textbox "Password: required" [ref=e3]': prefilled`)), { indent: 4, role: "textbox", name: "Password: required", ref: "e3", value: "prefilled" });
+    assert.deepEqual(pick(parseLine(`  - 'button "It''s: fine" [ref=e9]'`)), { indent: 2, role: "button", name: "It's: fine", ref: "e9", value: null });
+    assert.deepEqual(pick(parseLine(`- textbox "Plain" [active] [ref=e4]: "quoted: value"`)), { indent: 0, role: "textbox", name: "Plain", ref: "e4", value: "quoted: value" });
+    assert.deepEqual(pick(parseLine("- generic [ref=e6]: abc")), { indent: 0, role: "generic", name: null, ref: "e6", value: "abc" });
+    assert.equal(parseLine("plain text"), null);
+  });
+
+  it("get the run rule on a quoted editable field's value", () => {
+    const scrub = makeScrubber({ PW: "Zq8vK3mW9xT2" });
+    assert.equal(scrub(`- 'textbox "Key: main" [ref=e5]': Zq8vK3mW9x`, { runs: "fields" }), `- 'textbox "Key: main" [ref=e5]': <secret>PW</secret>`);
+  });
+
+  it("are hidden whole when they belong to a password field", async () => {
+    const page = {
+      locator: () => ({ elementHandle: () => Promise.reject(new Error("gone")) }),
+      frames: () => [],
+      isClosed: () => false,
+    };
+    const fields = new SecretFields({ pages: () => [page] } as never, {});
+    const text = `- 'textbox "Password: required" [ref=e3]': hunter2`;
+    await fields.refresh(text);
+    assert.equal(fields.mask(text), `- 'textbox "Password: required" [ref=e3]': [hidden by peeps-bridge]`);
+  });
+});
+
 describe("SecretFields failing closed", () => {
   it("hides an editable field's value when its ref cannot be resolved", async () => {
     const page = {
@@ -298,6 +328,26 @@ describe("secrets", () => {
     const units = [...Array(secret.length).keys()].map((i) => secret.charCodeAt(i).toString(16).padStart(4, "0"));
     for (const form of [units.map((u) => `\\u${u}`).join(""), units.map((u) => `\\u${u.toUpperCase()}`).join("")]) {
       assert.equal(scrub(`{"k":"${form}"}`), '{"k":"<secret>EMOJI</secret>"}', form);
+    }
+  });
+
+  it("survives a value with a lone surrogate (encodeURIComponent would throw), keeping literal and JSON forms", () => {
+    const broken = "abc😀".slice(0, 4);
+    const scrub = makeScrubber({});
+    assert.equal(scrub(`x ${broken} y`, { extraValues: [broken] }), "x <secret>a secret field</secret> y");
+    assert.equal(scrub(`x ${JSON.stringify(broken).slice(1, -1)} y`, { extraValues: [broken] }), "x <secret>a secret field</secret> y");
+    assert.equal(makeScrubber({ LONE: broken })(`x ${broken} y`), "x <secret>LONE</secret> y");
+  });
+
+  it("scrubs the ensure_ascii JSON form (only code units of 0x7f and above escaped), in both cases", () => {
+    for (const secret of ["pässwörd", "Ab😀cd🔑Zz9!"]) {
+      const scrub = makeScrubber({ PW: secret });
+      for (const upper of [false, true]) {
+        const form = JSON.stringify(secret)
+          .slice(1, -1)
+          .replace(/[\u007f-\uffff]/g, (c) => `\\u${upper ? c.charCodeAt(0).toString(16).padStart(4, "0").toUpperCase() : c.charCodeAt(0).toString(16).padStart(4, "0")}`);
+        assert.equal(scrub(`{"p":"${form}"}`), '{"p":"<secret>PW</secret>"}', form);
+      }
     }
   });
 

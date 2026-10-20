@@ -169,8 +169,10 @@ prints, the runner also removes:
   into, and any editable field (input, textarea, contenteditable, in any
   frame of the active tab) that a scan after every call finds holding the
   value or a run of it, however it got there. Every value such a field holds
-  during the session is hidden on its snapshot line (and on every line nested
-  under it, such as a contenteditable's text) whatever its length, and
+  during the session is hidden on its snapshot line and on every line nested
+  under it (a contenteditable's text), whatever its length and however
+  Playwright writes the line (a name containing `: ` makes it quote the
+  whole key), and
   removed from the whole result when 4 or more characters long. Fields are
   followed by element, not by Playwright's `ref`, which restarts with every
   page;
@@ -218,6 +220,11 @@ then the scratch directory, then the process. On Windows the runner
 cannot list its child processes (it uses `pgrep`), so after a forced exit
 Chromium may briefly outlive it and its profile directory may need removing
 by hand.
+
+One browser call may take at most 90 seconds. Some operations have no
+timeout of their own (listing tabs reads each page's title, which a page stuck
+in a loop never answers); past the deadline the call is answered with an
+error, and the runner closes the browser and ends the session.
 
 The runner never follows an HTTP redirect from Peeps: a redirect would re-send
 the grant to wherever it pointed.

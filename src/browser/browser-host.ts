@@ -48,6 +48,14 @@ export interface BrowserHostOptions {
    * starts, so a forced exit during startup can still remove it.
    */
   onScratch?: (directory: string) => void;
+  /**
+   * The longest one call may take. Some @playwright/mcp operations have no
+   * timeout of their own (listing tabs reads each page's title, which a page
+   * stuck in a loop never answers), so past this the call is answered with
+   * an error and `onStuck` is told: the browser cannot be trusted to finish.
+   */
+  callDeadlineMs?: number;
+  onStuck?: () => void;
 }
 
 export interface BrowserHost {
@@ -90,6 +98,11 @@ function snapshotFiles(output: string): Map<string, number> {
   return files;
 }
 
+/** Comfortably under Peeps' own 120 s wait for a browser call. */
+export const CALL_DEADLINE_MS = 90_000;
+/** How long each cleanup step may take before the next one runs anyway. */
+const CLEANUP_STEP_MS = 5_000;
+
 const EVERYWHERE = new Set(["browser_console_messages", "browser_network_requests"]);
 
 const SERVICE_WORKER_BLOCK = `(() => {
@@ -115,7 +128,8 @@ export async function startBrowserHost(options: BrowserHostOptions): Promise<Bro
   const cleanup = async () => {
     for (const step of cleanups.reverse()) {
       try {
-        await step();
+        // Bounded: a browser stuck in a page's loop must not hold up the rest.
+        await Promise.race([step(), new Promise((resolve) => setTimeout(resolve, CLEANUP_STEP_MS).unref())]);
       } catch {
         // Keep going: every later step still has to run.
       }
@@ -233,14 +247,27 @@ export async function startBrowserHost(options: BrowserHostOptions): Promise<Bro
         }
         await tracked.before(name, args);
         const before = snapshotFiles(output);
-        const raw = await link.callTool(name, args);
+        const deadlineMs = options.callDeadlineMs ?? CALL_DEADLINE_MS;
+        let timer: NodeJS.Timeout | undefined;
+        const raw = await Promise.race([
+          link.callTool(name, args),
+          new Promise<null>((resolve) => {
+            timer = setTimeout(() => resolve(null), deadlineMs);
+          }),
+        ]).finally(() => clearTimeout(timer));
+        if (raw === null) {
+          options.onStuck?.();
+          return {
+            content: [{ type: "text", text: `${name} did not finish within ${Math.round(deadlineMs / 1000)} s: the page is not responding. The runner is closing the browser and ending this session.` }],
+            isError: true,
+          };
+        }
         // Only snapshot files @playwright/mcp wrote during this call may be
         // inlined: a link in the text is not authority to read a file.
         const written = new Set([...snapshotFiles(output)].filter(([file, mtime]) => before.get(file) !== mtime).map(([file]) => file));
         const text = collectText(raw, workspace, written);
         await tracked.refresh(text ?? "");
         const blind = tracked.blindReason();
-        if (blind) notes.push(blind);
         const refused = notes.splice(0);
         const runs = EVERYWHERE.has(name) ? "everywhere" : "fields";
         return shapeResult(text === null ? raw : { content: [{ type: "text", text }], isError: raw.isError }, {
@@ -248,6 +275,7 @@ export async function startBrowserHost(options: BrowserHostOptions): Promise<Bro
           scrub: (text) => scrubSecrets(text, { extraValues: tracked.scrubbable(), runs }),
           blocked: [...blocked],
           notes: refused,
+          info: blind ? [blind] : [],
           transform: (text) => tracked.mask(text),
         });
       },

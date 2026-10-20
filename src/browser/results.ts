@@ -32,6 +32,8 @@ export interface ShapeOptions {
   blocked?: string[];
   /** Other things the runner refused (a download), one line each. */
   notes?: string[];
+  /** Plain information for the agent (not a refusal), one line each. */
+  info?: string[];
 }
 
 const SNAPSHOT_LINK = /^- \[Snapshot\]\(([^)\n]+)\)$/gm;
@@ -77,6 +79,8 @@ export function shapeResult(raw: { content?: unknown; isError?: unknown }, optio
     }
     for (const note of notes) text += `\n- ${note}`;
   }
+  const info = [...new Set(options.info ?? [])];
+  if (info.length > 0) text += `\n### Note${info.map((line) => `\n- ${line}`).join("")}`;
 
   if (options.transform) text = options.transform(text);
   text = cap(options.scrub(text));

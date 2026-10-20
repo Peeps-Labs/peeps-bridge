@@ -47,7 +47,7 @@ export function stallDecision(state: StallState, now: number, beat: number, stal
  * directory. POSIX only (`pgrep -P`); elsewhere it does nothing. Serialised
  * into the worker too, so it takes its `execFileSync` as an argument.
  */
-export function killDescendants(pid: number, exec: (file: string, args: string[], options: object) => string): void {
+export function killDescendants(pid: number, exec: (file: string, args: string[], options: object) => string, report: (line: string) => void = () => {}): void {
   // No inner named functions: this is serialised with toString(), and a
   // bundler's name-keeping helper would not exist in the worker.
   const found: number[] = [];
@@ -57,7 +57,12 @@ export function killDescendants(pid: number, exec: (file: string, args: string[]
     let out = "";
     try {
       out = exec("pgrep", ["-P", String(parent)], { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] });
-    } catch {
+    } catch (error) {
+      // pgrep exits 1 when there are none; anything else (no pgrep at all,
+      // as on Windows) means the browser may survive: say so, once.
+      if (parent === pid && (error as { status?: unknown }).status !== 1) {
+        report(`[peeps] could not list the browser's processes to stop them (${String((error as Error).message ?? error).slice(0, 120)}); Chromium may outlive the runner.`);
+      }
       continue;
     }
     for (const child of out.split(/\s+/).filter(Boolean).map(Number)) {
@@ -94,7 +99,12 @@ setInterval(() => {
     fs.writeSync(2, "\\n[peeps] the runner's event loop has been blocked for " + Math.round((t - beat[0]) / 1000) + " s; closing the browser and exiting.\\n");
   } catch {}
   // Chromium first: alive, it would recreate its profile after the rmSync.
-  try { killDescendants(workerData.pid, require("node:child_process").execFileSync); } catch {}
+  const say = (line) => { try { fs.writeSync(2, line + "\\n"); } catch {} };
+  try {
+    killDescendants(workerData.pid, require("node:child_process").execFileSync, say);
+  } catch (error) {
+    say("[peeps] could not stop the browser's processes: " + String(error && error.message || error).slice(0, 120));
+  }
   for (const directory of scratch) {
     try { fs.rmSync(directory, { recursive: true, force: true }); } catch {}
   }

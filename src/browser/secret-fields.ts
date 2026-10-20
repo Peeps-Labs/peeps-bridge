@@ -30,6 +30,7 @@ import type { BrowserContext, ElementHandle, Frame, Page } from "playwright-core
 
 import { activePage, dialogOpen } from "./mcp-patches.js";
 import { runLength, type Secrets } from "./secrets.js";
+import { parseLine, roleAndName, withValue } from "./snapshot-lines.js";
 
 export const HIDDEN = "[hidden by peeps-bridge]";
 /** Shorter values are hidden on their own field's line, not elsewhere. */
@@ -37,18 +38,9 @@ export const MIN_SCRUBBED_LENGTH = 4;
 /** The longest any one read of the page may take. */
 export const READ_TIMEOUT_MS = 500;
 
-// Playwright's own line shape: `- role "name" [attr] [ref=e4]: value`.
-// Linear: a literal role, an optional quoted name, then bracketed attributes.
-const VALUE_LINE = /^(\s*- ([a-z]+)(?: "(?:[^"\\]|\\.)*")?(?: \[[^\]\n]*\])*)(: )(.*)$/;
-const ROLE_NAME = /^\s*- ([a-z]+)(?: "((?:[^"\\]|\\.)*)")?/;
-const REF = /\[ref=([a-z0-9]+)\]/;
 const EDITABLE_ROLES = new Set(["textbox", "searchbox", "combobox", "spinbutton"]);
 const EDITABLE = "input:not([type=hidden]), textarea, [contenteditable]:not([contenteditable=false])";
 
-const roleName = (line: string): string | null => {
-  const match = ROLE_NAME.exec(line);
-  return match?.[2] ? `${match[1]} "${match[2]}"` : null;
-};
 
 /** A promise's value, or `fallback` once it rejects or takes too long. */
 export function bounded<T>(promise: Promise<T>, fallback: T, ms = READ_TIMEOUT_MS): Promise<T> {
@@ -66,6 +58,8 @@ interface Tracked {
   page: Page;
   frame: Frame | null;
   key: string | null;
+  /** The ref its line had in the latest snapshot that showed it. */
+  lastRef: string | null;
 }
 
 type Box = { x: number; y: number; width: number; height: number };
@@ -114,7 +108,7 @@ export class SecretFields {
     if (!page) return;
     for (const ref of this.secretRefs(tool, args)) {
       const handle = await this.resolve(page, ref);
-      if (handle) await this.track(handle, page, this.latest.get(ref) ?? null);
+      if (handle) await this.track(handle, page, this.latest.get(ref) ?? null, ref);
     }
   }
 
@@ -172,46 +166,64 @@ export class SecretFields {
     if (!page) return;
     await this.scan(page);
 
-    // A tracked element found by the scan has no known line yet: look for it
-    // among the lines with children (a contenteditable's), a bounded number.
     const lines = text.split("\n");
-    if (this.tracked.some((t) => t.key === null && t.page === page)) {
+    const parsed = lines.map(parseLine);
+    const refLine = new Map<string, number>();
+    for (const [i, p] of parsed.entries()) if (p?.ref) refLine.set(p.ref, i);
+
+    // Each tracked element's own line in this snapshot: its last known ref
+    // first (Playwright keeps an element's ref while it lives), otherwise a
+    // bounded search among the lines that can hold text, leaves included (an
+    // unnamed contenteditable is `- generic [ref=e2]: text`).
+    const found = new Set<Tracked>();
+    for (const t of this.tracked) {
+      if (t.page !== page || !t.lastRef || !refLine.has(t.lastRef)) continue;
+      const handle = await this.resolve(page, t.lastRef);
+      if (handle && (await this.trackedFor(handle)) === t) {
+        this.hiddenRefs.add(t.lastRef);
+        found.add(t);
+      }
+      void handle?.dispose().catch(() => {});
+    }
+    if (this.tracked.some((t) => t.page === page && !found.has(t))) {
       let looked = 0;
-      for (const [i, line] of lines.entries()) {
-        const ref = REF.exec(line)?.[1];
-        const next = lines[i + 1];
-        if (!ref || !next || next.length - next.trimStart().length <= line.length - line.trimStart().length) continue;
+      for (const [i, p] of parsed.entries()) {
+        if (!p?.ref || this.hiddenRefs.has(p.ref)) continue;
+        const next = parsed[i + 1];
+        const holdsText = p.value !== null || (next !== undefined && next !== null && next.indent > p.indent);
+        if (!holdsText) continue;
         if (++looked > 200) break;
-        const handle = await this.resolve(page, ref);
+        const handle = await this.resolve(page, p.ref);
         if (!handle) continue;
         const t = await this.trackedFor(handle);
         void handle.dispose().catch(() => {});
         if (t) {
-          this.hiddenRefs.add(ref);
-          t.key ??= roleName(line);
+          this.hiddenRefs.add(p.ref);
+          t.lastRef = p.ref;
+          t.key ??= roleAndName(p);
         }
       }
     }
 
-    for (const line of lines) {
-      const match = VALUE_LINE.exec(line);
-      const ref = match && EDITABLE_ROLES.has(match[2]!) ? REF.exec(line)?.[1] : undefined;
-      if (!ref) continue;
-      const handle = await this.resolve(page, ref);
+    // Every editable field's own line: a password field, or one the runner
+    // cannot identify, is hidden.
+    for (const p of parsed) {
+      if (!p?.ref || p.value === null || !p.role || !EDITABLE_ROLES.has(p.role) || this.hiddenRefs.has(p.ref)) continue;
+      const handle = await this.resolve(page, p.ref);
       if (!handle) {
-        // Cannot tell whether it is a password field: fail closed.
-        this.hiddenRefs.add(ref);
+        this.hiddenRefs.add(p.ref);
         continue;
       }
       try {
         if (await bounded(handle.evaluate((el) => el instanceof HTMLInputElement && el.type === "password"), true)) {
-          this.hiddenRefs.add(ref);
+          this.hiddenRefs.add(p.ref);
           continue;
         }
         const t = await this.trackedFor(handle);
         if (t) {
-          this.hiddenRefs.add(ref);
-          t.key ??= roleName(line);
+          this.hiddenRefs.add(p.ref);
+          t.lastRef = p.ref;
+          t.key ??= roleAndName(p);
         }
       } finally {
         void handle.dispose().catch(() => {});
@@ -232,12 +244,12 @@ export class SecretFields {
   /** Hide the value on every line of a tracked or password field. */
   mask(text: string): string {
     const lines = text.split("\n");
+    const parsed = lines.map(parseLine);
     if (text.includes("### Snapshot")) {
       this.latest = new Map();
-      for (const line of lines) {
-        const ref = REF.exec(line)?.[1];
-        const name = roleName(line);
-        if (ref && name) this.latest.set(ref, name);
+      for (const p of parsed) {
+        const key = roleAndName(p);
+        if (p?.ref && key) this.latest.set(p.ref, key);
       }
     }
     const page = this.page();
@@ -245,32 +257,32 @@ export class SecretFields {
     const out: string[] = [];
     // While set, lines indented deeper than this belong to a hidden element.
     let hiddenBelow = -1;
-    for (const line of lines) {
+    for (const [i, line] of lines.entries()) {
+      const p = parsed[i];
       const indent = line.length - line.trimStart().length;
       if (hiddenBelow >= 0) {
         if (indent > hiddenBelow && line.trim() !== "") continue;
         hiddenBelow = -1;
       }
-      const ref = REF.exec(line)?.[1];
-      const name = roleName(line);
-      // The element itself is tracked (or a password field): its value and
-      // everything nested under it (a contenteditable's text and blocks).
-      const whole = (ref !== undefined && this.hiddenRefs.has(ref)) || (name !== null && keys.has(name));
-      const match = VALUE_LINE.exec(line);
-      if (whole) {
-        hiddenBelow = indent;
-        out.push(match ? `${match[1]}${match[3]}${HIDDEN}` : /:$/.test(line) ? `${line} ${HIDDEN}` : line);
-        continue;
-      }
-      if (!match) {
+      if (!p) {
         out.push(line);
         continue;
       }
-      const value = match[4]!;
-      const unquoted = /^"(.*)"$/.exec(value)?.[1] ?? value;
-      const editable = EDITABLE_ROLES.has(match[2]!);
-      const sensitive = (this.blind && editable) || (unquoted.length >= MIN_SCRUBBED_LENGTH && this.history.has(unquoted));
-      out.push(sensitive ? `${match[1]}${match[3]}${HIDDEN}` : line);
+      const key = roleAndName(p);
+      // The element itself is tracked (or a password field): its value and
+      // everything nested under it (a contenteditable's text and blocks).
+      if ((p.ref !== null && this.hiddenRefs.has(p.ref)) || (key !== null && keys.has(key))) {
+        hiddenBelow = indent;
+        out.push(p.opensChildren || p.value !== null ? withValue(p, HIDDEN) : line);
+        continue;
+      }
+      if (p.value === null) {
+        out.push(line);
+        continue;
+      }
+      const editable = p.role !== null && EDITABLE_ROLES.has(p.role);
+      const sensitive = (this.blind && editable) || (p.value.length >= MIN_SCRUBBED_LENGTH && this.history.has(p.value));
+      out.push(sensitive ? withValue(p, HIDDEN) : line);
     }
     return out.join("\n");
   }
@@ -300,8 +312,8 @@ export class SecretFields {
     });
   }
 
-  private async track(handle: ElementHandle, page: Page, key: string | null): Promise<void> {
-    this.tracked.push({ handle, page, frame: await bounded(handle.ownerFrame(), null), key });
+  private async track(handle: ElementHandle, page: Page, key: string | null, lastRef: string | null = null): Promise<void> {
+    this.tracked.push({ handle, page, frame: await bounded(handle.ownerFrame(), null), key, lastRef });
   }
 
   /** The tracked entry for this element, compared only within its frame. */

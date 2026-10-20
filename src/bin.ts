@@ -40,7 +40,13 @@ const force = async () => {
   await Promise.race([host?.close(), new Promise((resolve) => setTimeout(resolve, CLOSE_GRACE_MS))]);
   // Whatever close() did not get to. Chromium first (it may still be
   // starting): alive, it would recreate its profile after the removal.
-  killDescendants(process.pid, execFileSync as never);
+  killDescendants(process.pid, execFileSync as never, (line) => {
+    try {
+      fs.writeSync(2, `${line}\n`);
+    } catch {
+      // The terminal is gone.
+    }
+  });
   for (const directory of scratch) {
     try {
       fs.rmSync(directory, { recursive: true, force: true });

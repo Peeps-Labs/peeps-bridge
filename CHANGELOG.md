@@ -42,5 +42,11 @@ First release: the runner for Peeps local discovery (PQA-2314).
   kills Chromium before removing the scratch directory, from the moment it
   exists; JSON escapes are generated per UTF-16 code unit; unidentified
   fields are hidden; patched internals are checked at startup.
+- Review round 5: snapshot lines are parsed in both of Playwright's key
+  forms (plain and YAML-quoted); an unnamed leaf contenteditable is found by
+  its own line; values with a lone surrogate no longer break scrubbing; the
+  ensure_ascii JSON form is scrubbed; each browser call has a 90 s deadline
+  after which the browser is closed and the session ended; a failed kill of
+  Chromium is reported; the dialog note has its own heading.
 - `@peepsai/bridge/protocol`: the bridge protocol loop with no browser
   dependency, for `peeps-action` to share.

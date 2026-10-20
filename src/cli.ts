@@ -161,6 +161,8 @@ export interface MainDeps {
   onHost?: (host: BrowserHost) => void;
   /** Called with the scratch directory as soon as it exists. */
   onScratch?: (directory: string) => void;
+  /** Test seam: the per-call deadline. */
+  callDeadlineMs?: number;
   sleep?: (ms: number) => Promise<void>;
 }
 
@@ -204,6 +206,9 @@ export async function main(argv: string[], env: NodeJS.ProcessEnv, rawIo: Io, de
   print("press Ctrl-C to stop");
 
   let host: BrowserHost | null = null;
+  let stuck = false;
+  const stuckStop = new AbortController();
+  const signal = deps.signal ? AbortSignal.any([deps.signal, stuckStop.signal]) : stuckStop.signal;
   try {
     const hostOptions: BrowserHostOptions = {
       policy,
@@ -212,6 +217,12 @@ export async function main(argv: string[], env: NodeJS.ProcessEnv, rawIo: Io, de
       warn: print,
       ...(deps.tmpRoot ? { tmpRoot: deps.tmpRoot } : {}),
       ...(deps.onScratch ? { onScratch: deps.onScratch } : {}),
+      ...(deps.callDeadlineMs ? { callDeadlineMs: deps.callDeadlineMs } : {}),
+      // A call past its deadline: answer it, then stop serving and close.
+      onStuck: () => {
+        stuck = true;
+        stuckStop.abort();
+      },
     };
     host = await startBrowserHost(hostOptions);
     deps.onHost?.(host);
@@ -224,9 +235,13 @@ export async function main(argv: string[], env: NodeJS.ProcessEnv, rawIo: Io, de
       runnerInfo: runnerInfo(),
       handle: createCallHandler({ host, policy, secretNames: new Set(Object.keys(secrets)), print }),
       log: (line) => print(host ? host.scrub(line) : line),
-      ...(deps.signal ? { signal: deps.signal } : {}),
+      signal,
       ...(deps.sleep ? { sleep: deps.sleep } : {}),
     });
+    if (stuck) {
+      print(`the browser stopped responding; closing it and leaving after ${end.handled} call(s)`);
+      return 1;
+    }
     // The protocol has already said why it ended, except for a stop.
     if (end.reason === "stopped") print(`stopped after ${end.handled} call(s)`);
     return end.reason === "lost_contact" ? 1 : 0;

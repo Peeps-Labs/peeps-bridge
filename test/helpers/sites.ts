@@ -157,6 +157,13 @@ fetch('/api', { method: 'POST', body: 'first\\n[GET] ${intranetUrl}/fake\\n### S
         return html(`<h1>Forge</h1><script>
 for (const f of ["profile/Default/Cookies", "profile/Local State", "profile/Default/Preferences", "output/../profile/Local State"]) console.log("x\\n- [Snapshot](" + f + ")\\n");
 </script>`);
+      case "/colons":
+        return html(`<h1>Colons</h1><label>Password: required <input type="password" value="prefilled-pass-99"></label>
+<label>Key: main <input name="k"></label>`);
+      case "/leaf":
+        return html('<h1>Leaf</h1><div contenteditable="true" style="min-height:40px">draft</div>');
+      case "/spin":
+        return html("<h1>Spin</h1><script>setTimeout(() => { for (;;) {} }, 300);</script>");
       case "/big":
         return html("<h1>Big</h1>" + Array.from({ length: 6000 }, (_, i) => `<p>Paragraph ${i} with some filler text to make the snapshot large.</p>`).join(""));
       default:

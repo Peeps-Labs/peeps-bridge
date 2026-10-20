@@ -226,6 +226,22 @@ describe("main, serving a session", () => {
     assert.match(t.out.join("\n"), /type secret SHOP_PASSWORD into 'Password' and submit/);
   });
 
+  it("answers a call that hangs past the deadline, then closes the browser and exits 1", async () => {
+    bridge.callReplies.push(call(1, "browser_navigate", { url: `${sites.appUrl}/spin` }), call(2, "browser_wait_for", { time: 1 }), call(3, "browser_tabs", { action: "list" }), call(4, "browser_snapshot", {}));
+    const t = io();
+    const code = await main(command(), { PEEPS_RUNNER_GRANT: GRANT, E2E_SHOP_PASSWORD: "x" }, t.io, { tmpRoot: tmp, callDeadlineMs: 3000 });
+    assert.equal(code, 1);
+    const results = bridge.of("result").map((r) => JSON.stringify(r.body));
+    // The page's loop stalls the first call that reads it (a snapshot or the
+    // tab list): that call is answered at the deadline, and it is the last.
+    const stuckAt = results.findIndex((r) => /did not finish within 3 s/.test(r));
+    assert.ok(stuckAt >= 0, results.join("\n"));
+    assert.equal(results.length, stuckAt + 1);
+    assert.ok(bridge.of("calls").length <= stuckAt + 1);
+    assert.match(t.out.join("\n"), /the browser stopped responding/);
+    assert.deepEqual(fs.readdirSync(tmp), []);
+  });
+
   it("exits 1 with the next step when Peeps refuses the runner", async () => {
     bridge.attachReplies.push({ status: 409, body: { error: "other_runner" } });
     const t = io();
