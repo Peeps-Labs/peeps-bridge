@@ -65,7 +65,7 @@ In plain words:
   screenshots, install browsers or close the browser are refused here, even if
   Peeps asked for them, and so is any argument the tools do not declare (such
   as `filename`, which would write into your working directory).
-- **An isolated browser.** A fresh, in-memory Chromium profile: never your own
+- **An isolated browser.** A fresh, empty Chromium profile in a scratch directory, deleted on exit: never your own
   browser, cookies or extensions. Service workers and downloads are blocked,
   and WebRTC may send nothing around the proxy (no direct UDP).
   It uses Chromium's sandbox where your OS allows it and says so when it
@@ -81,13 +81,13 @@ In plain words:
   environment and kept in memory; the agent types only the name. Before
   anything leaves your machine the runner removes the value in its common
   encodings everywhere; any run of 6 or more of its characters from console
-  and network output, URLs, titles and form fields; and the contents of every
-  field it was typed into and of every password field, for the rest of the
-  session. Copy, cut, paste and dragging out of such a field are refused.
-  That stops the value leaking by accident and closes the cheap ways to read
-  it. It does not stop an agent that sets out to read it: editing the field
-  key by key (inserting a character between each of the secret's) shows it a
-  piece at a time. **Use a test account, never real credentials.**
+  and network output, URLs, titles, tab lists and form fields; and the
+  contents of every field holding it (wherever it landed), for the rest of
+  the session. Copy, cut, paste, middle-click and dragging out of such a
+  field are refused. That stops the value leaking by accident and closes the
+  cheap ways to read it. It does not stop an agent that sets out to read it
+  through a page that shows part of a field, or a changed form of it (see
+  SECURITY.md). **Use a test account, never real credentials.**
 - **Short-lived.** The grant works for one session, one person and one MCP
   connection, and only while the session lasts (at most 45 minutes). Peeps
   checks it on every request, so revoking the MCP connection, losing your

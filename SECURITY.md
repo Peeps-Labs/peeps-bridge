@@ -90,11 +90,11 @@ Only for the duration of one session, and only through a browser.
 - **No shell and no file access.** Playwright MCP writes its snapshots to a
   scratch directory under your OS temp directory, which the runner deletes when
   it exits. Nothing is written to your checkout.
-- **An isolated browser.** A fresh, in-memory Chromium profile: none of your
+- **An isolated browser.** A fresh, empty Chromium profile in the runner's scratch directory, deleted on exit: none of your
   own browser's cookies, logins or extensions. Service workers are blocked
   (Playwright's own block is extended to the `ServiceWorkerContainer`
   prototype, which a page could otherwise use to get around it), as are
-  downloads. Chromium runs inside its own sandbox where the OS allows it; on
+  downloads, and a page's file chooser is cancelled (the result says so). Chromium runs inside its own sandbox where the OS allows it; on
   Linux systems that restrict unprivileged user namespaces it cannot, and the
   runner says so when it starts.
 
@@ -108,7 +108,7 @@ this, the agent, or a page it visits, could steer a browser that sits inside
 your network to other local services, intranet hosts or cloud metadata
 endpoints and read them back as page text.
 
-It is enforced in three layers:
+It is enforced in four layers:
 
 1. **An allowlisting forward proxy inside the runner** is the authoritative
    check. Chromium is launched with every request going through it, loopback
@@ -162,29 +162,37 @@ prints, the runner also removes:
   printed lines, the Page URL and title, and the values of form fields. Not
   in other page text, where it would hide ordinary words (a secret containing
   `password` would hide the word "password");
-- the contents of every field the value was typed into, and of every password
-  field (`input[type=password]`) on every page and frame, and every value
-  those fields have held during the session: hidden on the field's snapshot
-  line whatever their length, and removed from the whole result when 4 or more
-  characters long. Fields are followed by element, not by Playwright's `ref`,
-  which restarts with every page;
+- the contents of every field holding the secret: each field it was typed
+  into, and any editable field (input, textarea, contenteditable, in any
+  frame of the active tab) that a scan after every call finds holding the
+  value or a run of it, however it got there. Every value such a field holds
+  during the session is hidden on its snapshot line whatever its length, and
+  removed from the whole result when 4 or more characters long. Fields are
+  followed by element, not by Playwright's `ref`, which restarts with every
+  page;
 - a `<secret>…</secret>` marker gets no exemption unless it names a
   configured secret.
 
-The runner also refuses copy, cut and paste keys (in every spelling), dragging
-out of a secret or password field, choosing a form field by CSS selector
-instead of `ref` (which would escape the tracking), and typing a secret one
-character at a time (it is filled at once, so a page sees no prefixes).
+A password field (`input[type=password]`) that holds no secret only has its
+own snapshot line hidden. Its value is not remembered or removed elsewhere,
+so a "1" typed into one never hides a "1" anywhere else.
 
-**What this does not cover.** An agent can edit a field key by key, for
-example inserting a character between each of the secret's, so that no run of
-6 is left and the field's contents are no longer what was typed; each
-snapshot then shows the secret a piece at a time. A page that transforms the
-value (hashes it, upper-cases it, reverses it, splits it across elements)
-can reveal it in that form. And `browser_wait_for` with a `text` answers yes
-or no to "is this text on the page", which an agent can use to test guesses
-about any page text. None of these happens by accident; all of them are
-available to an agent that sets out to read the value.
+The runner also refuses copy, cut and paste keys (in every spelling), a middle
+click (which pastes the primary selection on Linux), a drag that starts on,
+inside or over a secret or password field, choosing a form field by CSS
+selector instead of `ref` (which would escape the tracking), and typing a
+secret one character at a time (it is filled at once, so a page sees no
+prefixes).
+
+**What this does not cover.** The page is the remaining route. A page that
+shows part of a field's contents (its first five characters, say), or a
+changed form of them (upper-cased, reversed, split across elements, hashed),
+reveals that part or form: the runner removes only the exact contents and
+runs of 6 of the secret. An agent that edits a field and watches such a page
+can read the secret a piece at a time. And `browser_wait_for` with a `text`
+answers yes or no to "is this text on the page", which an agent can use to
+test guesses about any page text. None of these happens by accident; all of
+them are available to an agent that sets out to read the value.
 
 ## What you see
 

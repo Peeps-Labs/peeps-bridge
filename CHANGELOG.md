@@ -7,7 +7,7 @@ First release: the runner for Peeps local discovery (PQA-2314).
 - `peeps-bridge` command: serves one Peeps bridge session's browser tools
   from this machine, with the grant read from `PEEPS_RUNNER_GRANT` only.
 - Hosts `@playwright/mcp` 0.0.69 in-process (pinned and imported, never
-  fetched), with a runner-owned headless Chromium: in-memory profile,
+  fetched), with a runner-owned headless Chromium: a fresh profile in a scratch directory,
   1366x768, 15 s navigation and 10 s action timeouts, no image responses,
   service workers and downloads blocked, Chromium's sandbox where the OS
   allows it, and a scratch working directory removed on exit.
@@ -31,5 +31,11 @@ First release: the runner for Peeps local discovery (PQA-2314).
   are refused; the run rule is limited to console, network, URL, title and
   field values; the network log is rendered by the runner; SIGHUP stops
   cleanly.
+- Review round 3: a secret is tracked in any field it lands in; middle
+  clicks and drags from around a secret field are refused; tab titles and
+  URLs get the run rule; password fields with no secret hide only their own
+  line; the Chromium profile lives in the scratch directory; file choosers
+  are cancelled; broken upstream responses end the browser's; the watchdog
+  tolerates sleep; cleanup survives a closed terminal.
 - `@peepsai/bridge/protocol`: the bridge protocol loop with no browser
   dependency, for `peeps-action` to share.
