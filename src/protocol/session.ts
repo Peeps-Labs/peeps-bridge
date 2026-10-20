@@ -51,6 +51,12 @@ export interface BridgeSessionOptions {
   sleep?: (ms: number) => Promise<void>;
   now?: () => number;
   onPoll?: () => void;
+  /**
+   * How long one request may take before it counts as a transport error, so a
+   * connection that went silent (a laptop waking from sleep) cannot hang the
+   * runner. Comfortably above the 25-second long poll.
+   */
+  requestTimeoutMs?: number;
 }
 
 export type SessionEndReason =
@@ -115,6 +121,7 @@ export async function runBridgeSession(options: BridgeSessionOptions): Promise<S
   const sleep = options.sleep ?? ((ms: number) => defaultSleep(ms, signal));
   const base = options.server.replace(/\/+$/, "");
   const sessionPath = `/api/v1/bridge/sessions/${encodeURIComponent(options.sessionId)}`;
+  const requestTimeoutMs = options.requestTimeoutMs ?? 60_000;
   let handled = 0;
   let transportErrors = 0;
 
@@ -137,7 +144,7 @@ export async function runBridgeSession(options: BridgeSessionOptions): Promise<S
           ...(body === undefined ? {} : { "content-type": "application/json" }),
         },
         body: body === undefined ? undefined : JSON.stringify(body),
-        signal: abortable ? signal : undefined,
+        signal: AbortSignal.any([AbortSignal.timeout(requestTimeoutMs), ...(abortable && signal ? [signal] : [])]),
       });
       const text = await response.text();
       if (response.status >= 500 || response.status === 429) return null;
@@ -148,9 +155,8 @@ export async function runBridgeSession(options: BridgeSessionOptions): Promise<S
         parsed = null;
       }
       return { status: response.status, body: parsed };
-    } catch (error) {
+    } catch {
       if (abortable && signal?.aborted) throw new Stopped();
-      void error;
       return null;
     }
   };

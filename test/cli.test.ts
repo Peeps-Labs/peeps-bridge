@@ -1,0 +1,249 @@
+import { after, afterEach, before, beforeEach, describe, it } from "node:test";
+import assert from "node:assert/strict";
+import { spawn } from "node:child_process";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+
+import { main, parseCli, runnerInfo } from "../src/cli.js";
+import { FakeBridge, SESSION_ID, call } from "./helpers/fake-bridge.js";
+import { startSites, type Sites } from "./helpers/sites.js";
+
+const GRANT = "Bearer b1.1790000000000.c2lnbmF0dXJl";
+
+function io() {
+  const out: string[] = [];
+  const err: string[] = [];
+  return { out, err, io: { out: (l: string) => out.push(l), err: (l: string) => err.push(l) } };
+}
+
+describe("parseCli", () => {
+  const base = ["--server", "https://app.peepsai.com", "--session", SESSION_ID, "--target-url", "http://localhost:3000/"];
+
+  it("parses the minimal command", () => {
+    const parsed = parseCli(base);
+    assert.deepEqual(parsed, {
+      kind: "run",
+      server: "https://app.peepsai.com",
+      sessionId: SESSION_ID,
+      targetUrl: "http://localhost:3000/",
+      allowOrigins: [],
+      signInSecrets: [],
+    });
+  });
+
+  it("takes repeated --allow-origin and --sign-in-secret", () => {
+    const parsed = parseCli([...base, "--allow-origin", "https://a.example", "--allow-origin", "https://b.example", "--sign-in-secret", "P=MY_P"]);
+    assert.equal(parsed.kind, "run");
+    assert.deepEqual(parsed.kind === "run" && parsed.allowOrigins, ["https://a.example", "https://b.example"]);
+    assert.deepEqual(parsed.kind === "run" && parsed.signInSecrets, ["P=MY_P"]);
+  });
+
+  it("answers --help and --version", () => {
+    assert.equal(parseCli(["--help"]).kind, "help");
+    assert.equal(parseCli(["--version"]).kind, "version");
+  });
+
+  it("refuses a grant on the command line", () => {
+    assert.throws(() => parseCli([...base, "--grant", "b1.x.y"]), /PEEPS_RUNNER_GRANT/);
+    assert.throws(() => parseCli([...base, "--token=b1.x.y"]), /PEEPS_RUNNER_GRANT/);
+  });
+
+  it("refuses missing or malformed options", () => {
+    assert.throws(() => parseCli(["--session", SESSION_ID, "--target-url", "http://localhost:3000/"]), /--server is required/);
+    assert.throws(() => parseCli(["--server", "https://x", "--target-url", "http://localhost:3000/"]), /--session is required/);
+    assert.throws(() => parseCli(["--server", "https://x", "--session", SESSION_ID]), /--target-url is required/);
+    assert.throws(() => parseCli([...base.slice(0, 2), "--session", "not-a-uuid", ...base.slice(4)]), /--session must be the session id/);
+    assert.throws(() => parseCli(["--server", "http://app.peepsai.com", ...base.slice(2)]), /--server must be https/);
+    assert.throws(() => parseCli(["--server", "ftp://x", ...base.slice(2)]), /--server must be https/);
+    assert.throws(() => parseCli([...base, "--bogus"]), /Unknown option/);
+    assert.throws(() => parseCli([...base, "extra"]), /Unexpected argument/);
+  });
+
+  it("allows plain http only for a Peeps server on this machine", () => {
+    const parsed = parseCli(["--server", "http://localhost:3123", ...base.slice(2)]);
+    assert.equal(parsed.kind === "run" && parsed.server, "http://localhost:3123");
+    assert.equal(parseCli(["--server", "http://127.0.0.1:3123/", ...base.slice(2)]).kind, "run");
+  });
+});
+
+describe("runnerInfo", () => {
+  it("reports the versions it loaded and the OS, and nothing that names this machine's user or paths", () => {
+    const info = runnerInfo();
+    assert.equal(info.playwrightMcp, "0.0.69");
+    assert.match(String(info.playwrightCore), /^1\.59\./);
+    assert.match(String(info.bridge), /^\d+\.\d+\.\d+/);
+    assert.equal(info.os, process.platform);
+    const text = JSON.stringify(info);
+    assert.doesNotMatch(text, new RegExp(os.userInfo().username));
+    assert.doesNotMatch(text, /[/\\]home[/\\]|[/\\]Users[/\\]|[A-Z]:\\/);
+    assert.deepEqual(Object.keys(info).sort(), ["arch", "bridge", "node", "os", "playwrightCore", "playwrightMcp"]);
+  });
+});
+
+describe("main, before the browser", () => {
+  const args = ["--server", "https://app.peepsai.com", "--session", SESSION_ID, "--target-url", "http://localhost:3000/"];
+
+  it("prints help and exits 0", async () => {
+    const t = io();
+    assert.equal(await main(["--help"], {}, t.io), 0);
+    assert.match(t.out.join("\n"), /PEEPS_RUNNER_GRANT/);
+    assert.match(t.out.join("\n"), /--allow-origin/);
+  });
+
+  it("prints its version", async () => {
+    const t = io();
+    assert.equal(await main(["--version"], {}, t.io), 0);
+    assert.match(t.out[0]!, /^\d+\.\d+\.\d+/);
+  });
+
+  it("exits 2 on a usage error", async () => {
+    const t = io();
+    assert.equal(await main(["--nope"], {}, t.io), 2);
+    assert.match(t.err.join("\n"), /Unknown option/);
+  });
+
+  it("exits 2 without a grant", async () => {
+    const t = io();
+    assert.equal(await main(args, {}, t.io), 2);
+    assert.match(t.err.join("\n"), /PEEPS_RUNNER_GRANT is not set/);
+  });
+
+  it("exits 2 when a named secret's variable is missing", async () => {
+    const t = io();
+    assert.equal(await main([...args, "--sign-in-secret", "P=NOT_SET_HERE"], { PEEPS_RUNNER_GRANT: GRANT }, t.io), 2);
+    assert.match(t.err.join("\n"), /NOT_SET_HERE is not set/);
+  });
+
+  it("exits 2 on a bad --allow-origin", async () => {
+    const t = io();
+    assert.equal(await main([...args, "--allow-origin", "https://x.example/path"], { PEEPS_RUNNER_GRANT: GRANT }, t.io), 2);
+    assert.match(t.err.join("\n"), /--allow-origin takes an origin/);
+  });
+
+  it("exits 1 with the install command when Chromium is missing", async () => {
+    const t = io();
+    const code = await main(args, { PEEPS_RUNNER_GRANT: GRANT }, t.io, { preflight: () => ({ ok: false, message: "install it with npx -y playwright-core@1 install" }) });
+    assert.equal(code, 1);
+    assert.match(t.err.join("\n"), /install it with/);
+  });
+});
+
+describe("main, serving a session", () => {
+  let sites: Sites;
+  let bridge: FakeBridge;
+  let tmp: string;
+
+  before(async () => {
+    sites = await startSites();
+  });
+  after(() => sites.close());
+  beforeEach(async () => {
+    bridge = await new FakeBridge().start();
+    tmp = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-cli-"));
+  });
+  afterEach(async () => {
+    await bridge.stop();
+    fs.rmSync(tmp, { recursive: true, force: true });
+  });
+
+  const command = () => ["--server", bridge.url, "--session", SESSION_ID, "--target-url", `${sites.appUrl}/`, "--sign-in-secret", "SHOP_PASSWORD=E2E_SHOP_PASSWORD"];
+
+  it("attaches, serves calls, prints one line each, and exits 0 when Peeps ends the session", async () => {
+    bridge.callReplies.push(call(1, "browser_navigate", { url: `${sites.appUrl}/login` }));
+    const t = io();
+    const code = await main(command(), { PEEPS_RUNNER_GRANT: "b1.1790000000000.c2ln", E2E_SHOP_PASSWORD: "Peeps-Test-2026!" }, t.io, { tmpRoot: tmp });
+    assert.equal(code, 0);
+
+    const [attach] = bridge.of("attach");
+    // A bare grant gets its scheme; the instance id is a fresh UUID.
+    assert.equal(attach!.headers.authorization, "Bearer b1.1790000000000.c2ln");
+    assert.match(String(attach!.headers["x-peeps-runner-instance"]), /^[0-9a-f-]{36}$/);
+    const body = attach!.body as { tools: { name: string }[]; runnerInfo: Record<string, unknown> };
+    assert.equal(body.tools.length, 15);
+    assert.equal(body.runnerInfo.playwrightMcp, "0.0.69");
+
+    const result = bridge.of("result")[0]!.body as { ok: boolean; result: { content: { text: string }[] } };
+    assert.equal(result.ok, true);
+    assert.match(result.result.content[0]!.text, /```yaml\n[\s\S]*heading "Sign in"/);
+
+    const out = t.out.join("\n");
+    assert.match(out, /serving session 11111111/);
+    assert.match(out, new RegExp(`may reach: ${sites.appUrl.replace(/[.:/]/g, "\\$&")}`));
+    assert.match(out, /#1 navigate to .*\/login on \/login/);
+    assert.match(out, /Peeps ended the session/);
+    // The scratch directory is gone.
+    assert.deepEqual(fs.readdirSync(tmp), []);
+  });
+
+  it("types a secret that never reaches a posted result or the terminal", async () => {
+    bridge.callReplies.push(call(1, "browser_navigate", { url: `${sites.appUrl}/login` }));
+    // e5 is the sign-in page's password textbox (see browser.test.ts for a lookup).
+    bridge.callReplies.push(call(2, "browser_type", { ref: "e5", element: "Password", text: "SHOP_PASSWORD", submit: true }));
+    bridge.callReplies.push(call(3, "browser_network_requests", { static: false, requestBody: true, requestHeaders: true }));
+    const t = io();
+    const code = await main(command(), { PEEPS_RUNNER_GRANT: GRANT, E2E_SHOP_PASSWORD: "Peeps-Test-2026!" }, t.io, { tmpRoot: tmp });
+    assert.equal(code, 0);
+    const posted = JSON.stringify(bridge.of("result").map((r) => r.body));
+    assert.match(posted, /Server saw: password=<secret>SHOP_PASSWORD<\/secret>/);
+    assert.doesNotMatch(posted + t.out.join("\n") + t.err.join("\n"), /Peeps-Test-2026/);
+    assert.match(t.out.join("\n"), /type secret SHOP_PASSWORD into 'Password' and submit/);
+  });
+
+  it("exits 1 with the next step when Peeps refuses the runner", async () => {
+    bridge.attachReplies.push({ status: 409, body: { error: "other_runner" } });
+    const t = io();
+    const code = await main(command(), { PEEPS_RUNNER_GRANT: GRANT, E2E_SHOP_PASSWORD: "x" }, t.io, { tmpRoot: tmp });
+    assert.equal(code, 1);
+    assert.match(t.err.join("\n"), /start_local_discovery again/);
+    assert.deepEqual(fs.readdirSync(tmp), []);
+  });
+
+  it("exits 1 when it loses contact with Peeps", async () => {
+    await bridge.stop();
+    const t = io();
+    const code = await main(["--server", "http://127.0.0.1:9", ...command().slice(2)], { PEEPS_RUNNER_GRANT: GRANT, E2E_SHOP_PASSWORD: "x" }, t.io, {
+      tmpRoot: tmp,
+      sleep: async () => {},
+    });
+    assert.equal(code, 1);
+    assert.match(t.out.join("\n"), /lost contact/);
+  });
+});
+
+describe("the peeps-bridge process", () => {
+  it("stops cleanly on Ctrl-C, closing the browser and its scratch directory", async () => {
+    const sites = await startSites();
+    const bridge = await new FakeBridge().start();
+    // Idle polls, so the runner is waiting when the signal arrives.
+    bridge.callReplies.push(...Array.from({ length: 20 }, () => ({ status: 204, delayMs: 1000 })));
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-proc-"));
+    try {
+      const child = spawn(
+        process.execPath,
+        ["--import", "tsx", "src/bin.ts", "--server", bridge.url, "--session", SESSION_ID, "--target-url", `${sites.appUrl}/`],
+        { env: { ...process.env, PEEPS_RUNNER_GRANT: GRANT, TMPDIR: tmp, TMP: tmp, TEMP: tmp }, stdio: ["ignore", "pipe", "pipe"] },
+      );
+      let output = "";
+      child.stdout.on("data", (c) => (output += c));
+      child.stderr.on("data", (c) => (output += c));
+      const deadline = Date.now() + 30_000;
+      while (!/attached/.test(output) && Date.now() < deadline) await new Promise((r) => setTimeout(r, 100));
+      assert.match(output, /attached/);
+      assert.ok(fs.readdirSync(tmp).some((d) => d.startsWith("peeps-bridge-")));
+      const exited = new Promise<number | null>((resolve) => child.on("exit", (code) => resolve(code)));
+      child.kill("SIGINT");
+      const code = await exited;
+      assert.equal(code, 0, output);
+      assert.match(output, /stopped/);
+      assert.deepEqual(
+        fs.readdirSync(tmp).filter((d) => d.startsWith("peeps-bridge-")),
+        [],
+      );
+    } finally {
+      await bridge.stop();
+      await sites.close();
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+});

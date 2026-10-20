@@ -302,3 +302,39 @@ describe("staying alive and leaving", () => {
     assert.equal(bridge.of("attach")[0]!.path, `/api/v1/bridge/sessions/${SESSION_ID}/attach`);
   });
 });
+
+describe("edges", () => {
+  it("names a refusal whose body is not JSON by its status", async () => {
+    bridge.attachReplies.push({ status: 403, body: undefined });
+    const error = await runBridgeSession(options()).catch((e: unknown) => e);
+    assert.ok(error instanceof BridgeRefusedError);
+    assert.equal(error.code, "http_403");
+    assert.match(error.message, /refused this runner \(403 http_403\)/);
+  });
+
+  it("wakes from a backoff when stopped (the real sleep)", async () => {
+    bridge.callReplies.push("drop");
+    const controller = new AbortController();
+    setTimeout(() => controller.abort(), 200);
+    const started = Date.now();
+    const { sleep: _unused, ...rest } = options({ signal: controller.signal });
+    const end = await runBridgeSession(rest);
+    assert.equal(end.reason, "stopped");
+    assert.ok(Date.now() - started < 1500, "the 2 s backoff was cut short");
+  });
+
+  it("ignores a 200 poll without a call", async () => {
+    bridge.callReplies.push({ status: 200, body: {} }, call(1));
+    const end = await runBridgeSession(options());
+    assert.equal(end.handled, 1);
+  });
+});
+
+describe("a silent network", () => {
+  it("counts a request that never answers as a transport error, so a dropped connection cannot hang the runner", async () => {
+    bridge.callReplies.push({ status: 204, delayMs: 2000 }, call(1));
+    const end = await runBridgeSession(options({ requestTimeoutMs: 300 }));
+    assert.equal(end.handled, 1);
+    assert.ok(lines.some((l) => /poll failed \(1\/8\)/.test(l)), lines.join("\n"));
+  });
+});

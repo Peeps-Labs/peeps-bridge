@@ -145,3 +145,32 @@ describe("the origin proxy's request forms", () => {
     assert.match(await raw(`GET https://127.0.0.1:${allowedPort}/ HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n`), /^HTTP\/1\.1 400/);
   });
 });
+
+describe("the origin proxy and allowed upgrades", () => {
+  it("forwards an absolute-form upgrade to an allowed origin", async () => {
+    const upgraded = http.createServer();
+    upgraded.on("upgrade", (req, socket) => {
+      socket.end(`HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nX-Path: ${req.url}\r\nX-Proxy: ${req.headers["proxy-authorization"] ?? "none"}\r\n\r\n`);
+    });
+    const port = await listen(upgraded);
+    const p = await startOriginProxy(OriginPolicy.from(`http://127.0.0.1:${port}/`, []), () => {});
+    try {
+      const proxyUrl = new URL(p.url);
+      const response = await new Promise<string>((resolve, reject) => {
+        const s = net.connect(Number(proxyUrl.port), proxyUrl.hostname, () =>
+          s.write(`GET http://127.0.0.1:${port}/live?x=1 HTTP/1.1\r\nHost: 127.0.0.1:${port}\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nProxy-Authorization: Basic eA==\r\n\r\n`),
+        );
+        let d = "";
+        s.on("data", (c) => (d += c));
+        s.on("close", () => resolve(d));
+        s.on("error", reject);
+      });
+      assert.match(response, /^HTTP\/1\.1 101/);
+      assert.match(response, /X-Path: \/live\?x=1/);
+      assert.match(response, /X-Proxy: none/);
+    } finally {
+      await p.close();
+      upgraded.close();
+    }
+  });
+});
