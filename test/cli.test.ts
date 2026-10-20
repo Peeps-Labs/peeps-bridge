@@ -6,7 +6,7 @@ import os from "node:os";
 import path from "node:path";
 
 import { main, parseCli, runnerInfo, safeIo } from "../src/cli.js";
-import { FakeBridge, SESSION_ID, call } from "./helpers/fake-bridge.js";
+import { FakeBridge, SESSION_ID, call, type Reply } from "./helpers/fake-bridge.js";
 import { startSites, type Sites } from "./helpers/sites.js";
 
 const GRANT = "Bearer b1.1790000000000.c2lnbmF0dXJl";
@@ -310,13 +310,75 @@ describe("the peeps-bridge process", () => {
       assert.equal(code, 130, output);
       assert.match(output, /closing the browser now/);
       assert.deepEqual(
-        fs.readdirSync(tmp).filter((d) => d.startsWith("peeps-bridge-")),
+        fs.readdirSync(tmp).filter((d) => d.startsWith("peeps-bridge-") || d.startsWith("playwright_chromiumdev_profile-")),
         [],
       );
     } finally {
       await bridge.stop();
       await sites.close();
       fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  /** Start the real command against a fake bridge; resolves once call 1 has run. */
+  async function startProcess(calls: Reply[]) {
+    const sites = await startSites();
+    const bridge = await new FakeBridge().start();
+    bridge.callReplies.push(...calls);
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-proc-"));
+    const child = spawn(
+      process.execPath,
+      ["--import", "tsx", "src/bin.ts", "--server", bridge.url, "--session", SESSION_ID, "--target-url", `${sites.appUrl}/`],
+      { env: { ...process.env, PEEPS_RUNNER_GRANT: GRANT, TMPDIR: tmp, TMP: tmp, TEMP: tmp }, stdio: ["ignore", "pipe", "pipe"] },
+    );
+    let output = "";
+    child.stdout.on("data", (c) => (output += c));
+    child.stderr.on("data", (c) => (output += c));
+    const exited = new Promise<{ code: number | null; signal: NodeJS.Signals | null }>((resolve) => child.on("exit", (code, signal) => resolve({ code, signal })));
+    const deadline = Date.now() + 30_000;
+    while (!/#1 /.test(output) && Date.now() < deadline) await new Promise((r) => setTimeout(r, 100));
+    await new Promise((r) => setTimeout(r, 500));
+    return {
+      child,
+      exited,
+      output: () => output,
+      leftovers: () => fs.readdirSync(tmp).filter((d) => d.startsWith("peeps-bridge-") || d.startsWith("playwright_chromiumdev_profile-")),
+      cleanup: async () => {
+        child.kill("SIGKILL");
+        await bridge.stop();
+        await sites.close();
+        fs.rmSync(tmp, { recursive: true, force: true });
+      },
+    };
+  }
+
+  it("stops on one Ctrl-C within the 10-second deadline, even while a call is stuck", async () => {
+    const p = await startProcess([call(1, "browser_snapshot", {}), call(2, "browser_wait_for", { time: 30 })]);
+    try {
+      await new Promise((r) => setTimeout(r, 500));
+      const started = Date.now();
+      p.child.kill("SIGINT");
+      const { code } = await p.exited;
+      const took = Date.now() - started;
+      assert.ok(took >= 9_000 && took < 16_000, `took ${took} ms`);
+      assert.equal(code, 130, p.output());
+      assert.deepEqual(p.leftovers(), []);
+    } finally {
+      await p.cleanup();
+    }
+  });
+
+  it("stops cleanly on SIGHUP (the terminal closing), like Ctrl-C", async () => {
+    const p = await startProcess([call(1, "browser_snapshot", {}), ...Array.from({ length: 20 }, () => ({ status: 204, delayMs: 1000 }))]);
+    try {
+      p.child.kill("SIGHUP");
+      const { code, signal } = await p.exited;
+      assert.equal(signal, null, p.output());
+      assert.equal(code, 0, p.output());
+      assert.match(p.output(), /stopping/);
+      assert.deepEqual(p.leftovers(), []);
+    } finally {
+      await p.cleanup();
     }
   });
 });

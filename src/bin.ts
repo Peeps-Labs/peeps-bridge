@@ -6,7 +6,7 @@
  * answer. A second Ctrl-C, or `STOP_DEADLINE_MS` after the first, closes the
  * browser and exits at once even if that call is stuck. If the event loop
  * itself is blocked, so that no handler can run, the watchdog thread kills
- * the process (`watchdog.ts`).
+ * the process (`watchdog.ts`). SIGTERM and SIGHUP stop it as Ctrl-C does.
  */
 
 import fs from "node:fs";
@@ -30,6 +30,14 @@ const force = async () => {
   // Synchronous: process.exit below would drop a pending pipe write.
   fs.writeSync(1, "[peeps] closing the browser now\n");
   await Promise.race([host?.close(), new Promise((resolve) => setTimeout(resolve, CLOSE_GRACE_MS))]);
+  // Whatever close() did not get to: the scratch and profile directories.
+  for (const directory of host?.scratchPaths() ?? []) {
+    try {
+      fs.rmSync(directory, { recursive: true, force: true });
+    } catch {
+      // Nothing more to do on the way out.
+    }
+  }
   process.exit(130);
 };
 
@@ -44,6 +52,11 @@ const onSignal = () => {
 };
 process.on("SIGINT", onSignal);
 process.on("SIGTERM", onSignal);
+// The terminal closing: the same orderly stop (Playwright's handler is off).
+process.on("SIGHUP", onSignal);
+// After SIGHUP the terminal is gone: a failed write must not stop the cleanup.
+process.stdout.on("error", () => {});
+process.stderr.on("error", () => {});
 
 const code = await main(
   process.argv.slice(2),
@@ -53,7 +66,7 @@ const code = await main(
     signal: stop.signal,
     onHost: (h) => {
       host = h;
-      watchdog.scratch(h.workspace);
+      for (const directory of h.scratchPaths()) watchdog.scratch(directory);
     },
   },
 );
