@@ -45,7 +45,7 @@ Consequences worth knowing:
 | Sent to Peeps | When |
 | --- | --- |
 | The text of pages the browser visits (accessibility snapshots, page titles and URLs) | After every browser action |
-| Console messages and network request summaries (URLs, methods, statuses; request bodies and headers only when the agent asks for them) | When the agent asks for them |
+| Console messages and network request summaries (URLs, methods, statuses; request bodies and headers only when the agent asks for them). Requests to other origins are left out, and `authorization`, `proxy-authorization`, `cookie` and `set-cookie` values are replaced | When the agent asks for them |
 | Error messages from the browser | When an action fails |
 | The runner's version, the `@playwright/mcp` and `playwright-core` versions it loaded, Node's version, OS and CPU architecture | When it attaches |
 | A list of origins the runner blocked during an action | When it blocked one |
@@ -81,8 +81,10 @@ Only for the duration of one session, and only through a browser.
   uploading files (`browser_file_upload`, which reads local files),
   screenshots, installing browsers, closing the browser, resizing it, any
   argument the tools do not declare (including `filename`, which would write
-  output into your working directory, and `_meta`), and navigation to anything
-  but an `http:` or `https:` URL.
+  output into your working directory, `_meta`, and the network log's `filter`,
+  which Playwright compiles as a regular expression in the runner's own
+  thread, where a pathological one would freeze it), and navigation to
+  anything but an `http:` or `https:` URL.
 - **No shell and no file access.** Playwright MCP writes its snapshots to a
   scratch directory under your OS temp directory, which the runner deletes when
   it exits. Nothing is written to your checkout.
@@ -97,7 +99,9 @@ Only for the duration of one session, and only through a browser.
 ### The origin policy
 
 The browser may reach the origin of `--target-url` (scheme, host and port
-exactly) and the origins you add with `--allow-origin`. Nothing else. Without
+exactly) and the origins you add with `--allow-origin`. Nothing else. The
+runner prints the list when it starts (`the browser may reach: …`): read it
+before letting the session run. Without
 this, the agent, or a page it visits, could steer a browser that sits inside
 your network to other local services, intranet hosts or cloud metadata
 endpoints and read them back as page text.
@@ -116,6 +120,10 @@ It is enforced in three layers:
    agent learns why.
 3. **The runner checks `browser_navigate`** against the policy before the
    browser moves.
+4. **WebRTC sends nothing around the proxy.** Chromium runs with
+   `--force-webrtc-ip-handling-policy=disable_non_proxied_udp`, so a page
+   cannot reach a host directly over UDP (STUN, ICE); a test proves no packet
+   reaches a disallowed UDP listener.
 
 The tests prove the proxy with real Chromium: a redirect to a disallowed
 origin, a disallowed image and `fetch`, a disallowed WebSocket and a redirect
@@ -131,22 +139,52 @@ uses.
 
 `--sign-in-secret NAME=ENV_VAR` reads `ENV_VAR` from your shell and gives the
 value to Playwright MCP in memory. The agent types `NAME`; Playwright fills in
-the value. So the value is never in the agent's prompt, Peeps' database or the
-model provider's logs.
+the value. So the agent is never given the value, and it is not in the call's
+arguments that Peeps stores.
 
-Playwright replaces a secret's value with `<secret>NAME</secret>` in its
-output, but by plain string replacement, which its own documentation calls
-"a convenience and not a security feature". So the runner also replaces the
-value, and its URL-encoded, form-encoded, JSON-escaped and HTML-escaped forms,
-in every result before it is posted and in every line it prints. A value your
-app transforms some other way (hashed, base64-encoded, split across elements)
-is not recognised.
+The value is in the page, though, and pages show what is typed into them.
+Playwright replaces an exact match with `<secret>NAME</secret>`, by plain
+string replacement, which its own documentation calls "a convenience and not
+a security feature". The runner adds, on every result before it is posted and
+every line it prints:
+
+- the value in plain, URL-encoded, form-encoded, JSON-escaped (`\uXXXX` and
+  `\/` too), HTML-escaped and HTML numeric-entity forms;
+- any run of consecutive characters of the value of 6 or more (half the value
+  for one shorter than 12, never under 3), so a value the agent shortened with
+  Backspace or Delete, or that a `maxlength` truncated, is caught wherever it
+  appears;
+- the contents of every field the value was typed into, for the rest of the
+  session: hidden on that field's snapshot line whatever their length, and
+  removed from the rest of the result when 4 or more characters long;
+- the contents of every password field (`input[type=password]`) on every page
+  and frame, the same way, whether or not a secret went into it.
+
+**What this does not cover.** An agent that is trying to read a secret, or a
+page that transforms it, can still get information out: a page that shows a
+hash of the value, every other character, its length, or splits it across
+elements; one or two characters left in a field after editing; text the page
+copies elsewhere and changes. Assume a determined agent or page could still
+recover a secret this way, and use a test account rather than real
+credentials. The run rule also hides harmless text that happens to
+share 6 characters with a secret (a secret containing `password` hides the
+word "password" on the page).
 
 ## What you see
 
 The runner prints one line per action ("click 'Place order' on /checkout",
 "type secret SHOP_PASSWORD into 'Password'"), so you can watch everything
-Peeps drives, and Ctrl-C stops it at any time.
+Peeps drives. Control characters are stripped from everything it prints,
+because much of it comes from Peeps or from pages, and a terminal obeys escape
+sequences (OSC 52 writes your clipboard).
+
+Ctrl-C lets the action in hand finish, for at most 10 seconds, then closes the
+browser; a second Ctrl-C closes it at once. If the runner's event loop were
+ever blocked so that no handler could run, a watchdog thread removes the
+scratch directory and kills the process after 30 seconds.
+
+The runner never follows an HTTP redirect from Peeps: a redirect would re-send
+the grant to wherever it pointed.
 
 ## Supply chain
 

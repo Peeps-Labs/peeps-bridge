@@ -29,7 +29,7 @@ PEEPS_RUNNER_GRANT=<grant> npx -y @peepsai/bridge@0.1.0 \
 | `--session` | The session `start_local_discovery` started. |
 | `--target-url` | Your app. The browser may reach this origin (scheme, host and port) and nothing else. |
 | `--allow-origin` | Another origin the browser may reach, such as your sign-in provider. Repeatable. |
-| `--sign-in-secret NAME=ENV_VAR` | Lets the agent sign in without seeing the password: it types `NAME`, and the browser fills in the value of `ENV_VAR` from your shell. Repeatable. |
+| `--sign-in-secret NAME=ENV_VAR` | Lets the agent sign in without being given the password: it types `NAME`, and the browser fills in the value of `ENV_VAR` from your shell. See "What it can and cannot do" for how far that goes. Repeatable. |
 | `PEEPS_RUNNER_GRANT` | The session's grant, from the environment only. A grant on the command line is refused, because any process on the machine can read command lines. |
 
 While it runs you see one line per action:
@@ -43,8 +43,12 @@ While it runs you see one line per action:
 [peeps] #3 type secret SHOP_PASSWORD into 'Password' on /login
 ```
 
-Press Ctrl-C to stop. The action in progress finishes, the browser closes and
-the runner exits. Press it again to close the browser at once.
+Check the `the browser may reach:` line: those origins, and nothing else, are
+what the browser can open.
+
+Press Ctrl-C to stop. The action in progress finishes (for at most 10
+seconds), the browser closes and the runner exits. Press it again to close the
+browser at once.
 
 ## What it can and cannot do
 
@@ -62,7 +66,8 @@ In plain words:
   Peeps asked for them, and so is any argument the tools do not declare (such
   as `filename`, which would write into your working directory).
 - **An isolated browser.** A fresh, in-memory Chromium profile: never your own
-  browser, cookies or extensions. Service workers and downloads are blocked.
+  browser, cookies or extensions. Service workers and downloads are blocked,
+  and WebRTC may send nothing around the proxy (no direct UDP).
   It uses Chromium's sandbox where your OS allows it and says so when it
   cannot.
 - **Your app only.** Every request the browser makes, including redirects,
@@ -71,11 +76,17 @@ In plain words:
   the ones you add with `--allow-origin`. That keeps the agent, and any page it
   visits, away from the rest of your network: other local services, your
   intranet, cloud metadata endpoints.
-- **Secrets stay local.** A value named with `--sign-in-secret` is read from
-  your environment and kept in memory. The agent only ever sees the name. The
-  runner also removes the value, in plain, URL-encoded, form-encoded, JSON and
-  HTML-escaped forms, from every result before it leaves your machine and from
-  every line it prints.
+- **Sign-in secrets are kept from the agent.** A value named with
+  `--sign-in-secret` is read from your environment and kept in memory; the
+  agent only ever types the name. Before anything leaves your machine the
+  runner removes the value in its common encodings, any run of 6 or more of
+  its characters (fewer for a short secret), and the contents of every field
+  it was typed into and of every password field, for the rest of the session.
+  That covers a value the agent edits afterwards or a `maxlength` truncates.
+  It is not a guarantee: a page that transforms the value (hashes it, shows
+  every other character, splits it across elements) can still reveal it, and
+  the run rule also hides ordinary text that happens to share 6 characters
+  with a secret. Use test accounts, not real credentials.
 - **Short-lived.** The grant works for one session, one person and one MCP
   connection, and only while the session lasts (at most 45 minutes). Peeps
   checks it on every request, so revoking the MCP connection, losing your
@@ -83,7 +94,8 @@ In plain words:
 
 What **does** leave your machine: the text of the pages the browser visits
 (accessibility snapshots), and console messages and network request summaries
-when the agent asks for them. That is what the agent reads to propose tests. For work you
+(for allowed origins only, with cookie and authorization headers removed) when
+the agent asks for them. That is what the agent reads to propose tests. For work you
 have not released yet, that is unreleased page text, and it goes to Peeps and
 to the model provider Peeps uses. Screenshots are never sent.
 

@@ -18,5 +18,11 @@ First release: the runner for Peeps local discovery (PQA-2314).
 - Results: the action's snapshot inlined, local file links dropped, blocked
   origins named, secret values scrubbed in every common encoding, capped at
   200 KB.
+- Review round 1: secret and password fields are hidden and their contents
+  scrubbed, runs of a secret's characters are redacted, WebRTC sends no UDP
+  around the proxy, page downloads are refused without crashing, the network
+  log keeps allowed origins only and drops credential headers, `filter` is
+  refused, output is stripped of terminal control characters, redirects from
+  Peeps are never followed, and Ctrl-C has a deadline and a watchdog.
 - `@peepsai/bridge/protocol`: the bridge protocol loop with no browser
   dependency, for `peeps-action` to share.
