@@ -21,6 +21,11 @@ export interface ShapeOptions {
   /** The scratch directory the MCP server writes into. */
   workspace: string;
   scrub: (text: string) => string;
+  /**
+   * The snapshot files `@playwright/mcp` wrote during this call (absolute
+   * paths). Only these are inlined; without it, none is.
+   */
+  snapshots?: ReadonlySet<string>;
   /** Applied to the text before scrubbing (secret-field masking). */
   transform?: (text: string) => string;
   /** Origins the runner refused during this call. */
@@ -36,15 +41,20 @@ const FILE_LINK = /^- \[([^\]\n]+)\]\((?![a-z][a-z0-9+.-]*:\/\/)[^)\n]+\)$/gim;
 /**
  * A result's text parts joined, with the action's snapshot file inlined and
  * links to other files on this machine dropped; null when it has no text.
+ *
+ * A link is not authority to read a file: a page can print
+ * `- [Snapshot](profile/Default/Cookies)` to its console. Only a file in
+ * `snapshots`, the ones written during this call under `output/`, is read.
  */
-export function collectText(raw: { content?: unknown }, workspace: string): string | null {
+export function collectText(raw: { content?: unknown }, workspace: string, snapshots: ReadonlySet<string> = new Set()): string | null {
   const parts = Array.isArray(raw?.content) ? (raw.content as { type?: unknown; text?: unknown }[]) : [];
   const texts = parts.filter((p) => p?.type === "text" && typeof p.text === "string").map((p) => p.text as string);
   if (texts.length === 0) return null;
   return texts
     .join("\n")
     .replace(SNAPSHOT_LINK, (_line, link: string) => {
-      const yaml = readInside(workspace, link);
+      const file = path.resolve(workspace, link);
+      const yaml = snapshots.has(file) ? readInside(path.join(workspace, "output"), file) : null;
       return yaml === null ? "(the snapshot was not available)" : "```yaml\n" + yaml.replace(/\n$/, "") + "\n```";
     })
     .replace(CONSOLE_LINK, "- New console entries: call browser_console_messages to read them")
@@ -52,7 +62,7 @@ export function collectText(raw: { content?: unknown }, workspace: string): stri
 }
 
 export function shapeResult(raw: { content?: unknown; isError?: unknown }, options: ShapeOptions): TextResult {
-  const collected = collectText(raw, options.workspace);
+  const collected = collectText(raw, options.workspace, options.snapshots);
   if (collected === null) {
     return { content: [{ type: "text", text: "The browser returned no text for this call." }], isError: true };
   }
@@ -75,11 +85,11 @@ export function shapeResult(raw: { content?: unknown; isError?: unknown }, optio
 
 /** A file's text, only when it resolves inside `root`. */
 function readInside(root: string, link: string): string | null {
-  const resolved = path.resolve(root, link);
-  const realRoot = fs.realpathSync(root);
+  let realRoot: string;
   let real: string;
   try {
-    real = fs.realpathSync(resolved);
+    realRoot = fs.realpathSync(root);
+    real = fs.realpathSync(path.resolve(root, link));
   } catch {
     return null;
   }

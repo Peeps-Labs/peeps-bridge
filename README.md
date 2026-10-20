@@ -47,8 +47,9 @@ Check the `the browser may reach:` line: those origins, and nothing else, are
 what the browser can open.
 
 Press Ctrl-C to stop. The action in progress finishes (for at most 10
-seconds), the browser closes and the runner exits. Press it again to close the
-browser at once.
+seconds), the browser closes and the runner exits, removing its scratch
+directory and the browser profile in it. Press it again to close the browser
+at once.
 
 ## What it can and cannot do
 

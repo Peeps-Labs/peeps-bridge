@@ -7,7 +7,7 @@ import path from "node:path";
 
 import { stallDecision } from "../src/watchdog.js";
 
-function runChild(mode: "stall" | "healthy") {
+function runChild(mode: "stall" | "healthy" | "chromium") {
   const scratch = path.join(fs.mkdtempSync(path.join(os.tmpdir(), "bridge-watchdog-")), "scratch");
   const child = spawn(process.execPath, ["--import", "tsx", "test/fixtures/watchdog-child.ts", mode, scratch], { stdio: ["ignore", "pipe", "pipe"] });
   let output = "";
@@ -28,6 +28,17 @@ describe("the event-loop watchdog", () => {
     assert.equal(fs.existsSync(result.scratch), false);
     assert.ok(result.ms < 10_000);
     fs.rmSync(path.dirname(result.scratch), { recursive: true, force: true });
+  });
+
+  it("kills Chromium too, so nothing is left under the scratch directory (4 runs)", async () => {
+    for (let run = 0; run < 4; run++) {
+      const result = await runChild("chromium");
+      assert.equal(result.signal, "SIGKILL", result.output);
+      // Long enough for an orphaned Chromium to recreate its profile.
+      await new Promise((r) => setTimeout(r, 2000));
+      assert.equal(fs.existsSync(result.scratch), false, `run ${run}: ${fs.existsSync(result.scratch) ? fs.readdirSync(result.scratch, { recursive: true }).slice(0, 5).join(", ") : ""}`);
+      fs.rmSync(path.dirname(result.scratch), { recursive: true, force: true });
+    }
   });
 
   it("leaves a healthy runner alone, and does not keep it alive", async () => {

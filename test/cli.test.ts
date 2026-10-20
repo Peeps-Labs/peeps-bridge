@@ -451,4 +451,30 @@ describe("the peeps-bridge process", () => {
       fs.rmSync(tmp, { recursive: true, force: true });
     }
   });
+
+  it("cleans up when Ctrl-C is pressed twice while the browser is still starting (real pty)", { skip: process.platform === "win32" }, async () => {
+    const bridge = await new FakeBridge().start();
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-pty-"));
+    try {
+      const result = await new Promise<string>((resolve, reject) => {
+        const py = spawn(
+          "python3",
+          ["test/fixtures/pty-close.py", "--ctrl-c", "press Ctrl-C to stop", process.execPath, "--import", "tsx", "src/bin.ts", "--server", bridge.url, "--session", SESSION_ID, "--target-url", "http://localhost:9/"],
+          { env: { ...process.env, PEEPS_RUNNER_GRANT: GRANT, TMPDIR: tmp, TMP: tmp, TEMP: tmp }, stdio: ["ignore", "pipe", "inherit"] },
+        );
+        let out = "";
+        py.stdout.on("data", (c) => (out += c));
+        py.on("error", reject);
+        py.on("exit", () => resolve(out));
+      });
+      const report = JSON.parse(result) as { seen: boolean; seconds: number; exitcode: number; output: string };
+      assert.ok(report.seen, report.output);
+      // Long enough for an orphaned Chromium to recreate its profile.
+      await new Promise((r) => setTimeout(r, 3000));
+      assert.deepEqual(fs.readdirSync(tmp).filter((d) => d.startsWith("peeps-bridge-")), [], report.output);
+    } finally {
+      await bridge.stop();
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
 });

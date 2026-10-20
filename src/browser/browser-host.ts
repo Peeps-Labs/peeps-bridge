@@ -43,6 +43,11 @@ export interface BrowserHostOptions {
   /** Test seam: where the scratch directory goes. */
   tmpRoot?: string;
   warn?: (line: string) => void;
+  /**
+   * Told the scratch directory the moment it exists, before the browser
+   * starts, so a forced exit during startup can still remove it.
+   */
+  onScratch?: (directory: string) => void;
 }
 
 export interface BrowserHost {
@@ -65,6 +70,26 @@ export interface BrowserHost {
   close(): Promise<void>;
 }
 
+/** `page-*.yml` snapshot files in the output directory, with their mtimes. */
+function snapshotFiles(output: string): Map<string, number> {
+  const files = new Map<string, number>();
+  let names: string[] = [];
+  try {
+    names = fs.readdirSync(output);
+  } catch {
+    return files;
+  }
+  for (const name of names) {
+    if (!/^page-[^/\\]+\.yml$/.test(name)) continue;
+    try {
+      files.set(path.join(output, name), fs.statSync(path.join(output, name)).mtimeMs);
+    } catch {
+      // Gone already.
+    }
+  }
+  return files;
+}
+
 const EVERYWHERE = new Set(["browser_console_messages", "browser_network_requests"]);
 
 const SERVICE_WORKER_BLOCK = `(() => {
@@ -78,6 +103,8 @@ type CreateConnection = (config: object, contextGetter: () => Promise<BrowserCon
 export async function startBrowserHost(options: BrowserHostOptions): Promise<BrowserHost> {
   const { policy } = options;
   const workspace = fs.mkdtempSync(path.join(options.tmpRoot ?? os.tmpdir(), "peeps-bridge-"));
+  options.onScratch?.(workspace);
+  const output = path.join(workspace, "output");
   const scrubSecrets = makeScrubber(options.secrets);
   const blocked: string[] = [];
   const notes: string[] = [];
@@ -168,7 +195,7 @@ export async function startBrowserHost(options: BrowserHostOptions): Promise<Bro
     const server = await createConnection(
       {
         browser: { browserName: "chromium", isolated: false },
-        outputDir: path.join(workspace, "output"),
+        outputDir: output,
         // Longest first: Playwright redacts in insertion order, and a shorter
         // secret inside a longer one would otherwise split it.
         secrets: longestFirst(options.secrets),
@@ -205,9 +232,15 @@ export async function startBrowserHost(options: BrowserHostOptions): Promise<Bro
           };
         }
         await tracked.before(name, args);
+        const before = snapshotFiles(output);
         const raw = await link.callTool(name, args);
-        const text = collectText(raw, workspace);
+        // Only snapshot files @playwright/mcp wrote during this call may be
+        // inlined: a link in the text is not authority to read a file.
+        const written = new Set([...snapshotFiles(output)].filter(([file, mtime]) => before.get(file) !== mtime).map(([file]) => file));
+        const text = collectText(raw, workspace, written);
         await tracked.refresh(text ?? "");
+        const blind = tracked.blindReason();
+        if (blind) notes.push(blind);
         const refused = notes.splice(0);
         const runs = EVERYWHERE.has(name) ? "everywhere" : "fields";
         return shapeResult(text === null ? raw : { content: [{ type: "text", text }], isError: raw.isError }, {

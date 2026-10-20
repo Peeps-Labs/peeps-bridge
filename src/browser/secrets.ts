@@ -57,6 +57,7 @@ export function longestFirst(secrets: Secrets): Secrets {
 }
 
 const html = (text: string) => text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;").replace(/'/g, "&#39;");
+const codeUnits = (text: string) => Array.from({ length: text.length }, (_, i) => text.charCodeAt(i));
 const codePoints = (text: string) => [...text].map((c) => c.codePointAt(0)!);
 
 /** Every form a value is likely to appear in. */
@@ -78,8 +79,10 @@ function variants(value: string): string[] {
     codePoints(value).map((c) => `&#${c};`).join(""),
     codePoints(value).map((c) => `&#x${c.toString(16)};`).join(""),
     codePoints(value).map((c) => `&#x${c.toString(16).toUpperCase()};`).join(""),
-    [...value].map((c) => `\\u${c.charCodeAt(0).toString(16).padStart(4, "0")}`).join(""),
-    [...value].map((c) => `\\u${c.charCodeAt(0).toString(16).padStart(4, "0").toUpperCase()}`).join(""),
+    // UTF-16 code units, as JSON escapes them: a character outside the BMP
+    // is a surrogate pair, two escapes.
+    codeUnits(value).map((u) => `\\u${u.toString(16).padStart(4, "0")}`).join(""),
+    codeUnits(value).map((u) => `\\u${u.toString(16).padStart(4, "0").toUpperCase()}`).join(""),
   ]);
   return [...forms].filter((f) => f.length > 0);
 }

@@ -172,14 +172,39 @@ export class SecretFields {
     if (!page) return;
     await this.scan(page);
 
-    for (const line of text.split("\n")) {
+    // A tracked element found by the scan has no known line yet: look for it
+    // among the lines with children (a contenteditable's), a bounded number.
+    const lines = text.split("\n");
+    if (this.tracked.some((t) => t.key === null && t.page === page)) {
+      let looked = 0;
+      for (const [i, line] of lines.entries()) {
+        const ref = REF.exec(line)?.[1];
+        const next = lines[i + 1];
+        if (!ref || !next || next.length - next.trimStart().length <= line.length - line.trimStart().length) continue;
+        if (++looked > 200) break;
+        const handle = await this.resolve(page, ref);
+        if (!handle) continue;
+        const t = await this.trackedFor(handle);
+        void handle.dispose().catch(() => {});
+        if (t) {
+          this.hiddenRefs.add(ref);
+          t.key ??= roleName(line);
+        }
+      }
+    }
+
+    for (const line of lines) {
       const match = VALUE_LINE.exec(line);
       const ref = match && EDITABLE_ROLES.has(match[2]!) ? REF.exec(line)?.[1] : undefined;
       if (!ref) continue;
       const handle = await this.resolve(page, ref);
-      if (!handle) continue;
+      if (!handle) {
+        // Cannot tell whether it is a password field: fail closed.
+        this.hiddenRefs.add(ref);
+        continue;
+      }
       try {
-        if (await bounded(handle.evaluate((el) => el instanceof HTMLInputElement && el.type === "password"), false)) {
+        if (await bounded(handle.evaluate((el) => el instanceof HTMLInputElement && el.type === "password"), true)) {
           this.hiddenRefs.add(ref);
           continue;
         }
@@ -192,6 +217,11 @@ export class SecretFields {
         void handle.dispose().catch(() => {});
       }
     }
+  }
+
+  /** Why this result's field values are hidden wholesale, if they are. */
+  blindReason(): string | null {
+    return this.blind ? "Field values are hidden in this result because a dialog is open, which stops the runner from reading the page. Handle the dialog, then take a snapshot." : null;
   }
 
   /** Values to scrub from a whole result: everything a tracked field has held. */
@@ -212,23 +242,37 @@ export class SecretFields {
     }
     const page = this.page();
     const keys = new Set(this.tracked.filter((t) => t.key && t.page === page).map((t) => t.key!));
-    return lines
-      .map((line) => {
-        const match = VALUE_LINE.exec(line);
-        if (!match) return line;
-        const value = match[4]!;
-        const unquoted = /^"(.*)"$/.exec(value)?.[1] ?? value;
-        const ref = REF.exec(line)?.[1];
-        const name = roleName(line);
-        const editable = EDITABLE_ROLES.has(match[2]!);
-        const sensitive =
-          (this.blind && editable) ||
-          (ref !== undefined && this.hiddenRefs.has(ref)) ||
-          (unquoted.length >= MIN_SCRUBBED_LENGTH && this.history.has(unquoted)) ||
-          (name !== null && editable && keys.has(name));
-        return sensitive ? `${match[1]}${match[3]}${HIDDEN}` : line;
-      })
-      .join("\n");
+    const out: string[] = [];
+    // While set, lines indented deeper than this belong to a hidden element.
+    let hiddenBelow = -1;
+    for (const line of lines) {
+      const indent = line.length - line.trimStart().length;
+      if (hiddenBelow >= 0) {
+        if (indent > hiddenBelow && line.trim() !== "") continue;
+        hiddenBelow = -1;
+      }
+      const ref = REF.exec(line)?.[1];
+      const name = roleName(line);
+      // The element itself is tracked (or a password field): its value and
+      // everything nested under it (a contenteditable's text and blocks).
+      const whole = (ref !== undefined && this.hiddenRefs.has(ref)) || (name !== null && keys.has(name));
+      const match = VALUE_LINE.exec(line);
+      if (whole) {
+        hiddenBelow = indent;
+        out.push(match ? `${match[1]}${match[3]}${HIDDEN}` : /:$/.test(line) ? `${line} ${HIDDEN}` : line);
+        continue;
+      }
+      if (!match) {
+        out.push(line);
+        continue;
+      }
+      const value = match[4]!;
+      const unquoted = /^"(.*)"$/.exec(value)?.[1] ?? value;
+      const editable = EDITABLE_ROLES.has(match[2]!);
+      const sensitive = (this.blind && editable) || (unquoted.length >= MIN_SCRUBBED_LENGTH && this.history.has(unquoted));
+      out.push(sensitive ? `${match[1]}${match[3]}${HIDDEN}` : line);
+    }
+    return out.join("\n");
   }
 
   /** Track every editable element on the page that holds a secret or a run of one. */

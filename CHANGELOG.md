@@ -37,5 +37,10 @@ First release: the runner for Peeps local discovery (PQA-2314).
   line; the Chromium profile lives in the scratch directory; file choosers
   are cancelled; broken upstream responses end the browser's; the watchdog
   tolerates sleep; cleanup survives a closed terminal.
+- Review round 4: lines nested under a secret field are hidden; only snapshot
+  files written during the call are inlined; a forced exit or the watchdog
+  kills Chromium before removing the scratch directory, from the moment it
+  exists; JSON escapes are generated per UTF-16 code unit; unidentified
+  fields are hidden; patched internals are checked at startup.
 - `@peepsai/bridge/protocol`: the bridge protocol loop with no browser
   dependency, for `peeps-action` to share.

@@ -41,10 +41,44 @@ export function stallDecision(state: StallState, now: number, beat: number, stal
   return { state: { lastTick: now, resumedAt }, kill: now - since >= stallMs };
 }
 
+/**
+ * Kill every process descended from `pid` (Chromium and its helpers), so
+ * none outlives a forced exit and recreates files under the scratch
+ * directory. POSIX only (`pgrep -P`); elsewhere it does nothing. Serialised
+ * into the worker too, so it takes its `execFileSync` as an argument.
+ */
+export function killDescendants(pid: number, exec: (file: string, args: string[], options: object) => string): void {
+  // No inner named functions: this is serialised with toString(), and a
+  // bundler's name-keeping helper would not exist in the worker.
+  const found: number[] = [];
+  const queue = [pid];
+  while (queue.length > 0) {
+    const parent = queue.shift()!;
+    let out = "";
+    try {
+      out = exec("pgrep", ["-P", String(parent)], { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] });
+    } catch {
+      continue;
+    }
+    for (const child of out.split(/\s+/).filter(Boolean).map(Number)) {
+      found.push(child);
+      queue.push(child);
+    }
+  }
+  for (const child of found) {
+    try {
+      process.kill(child, "SIGKILL");
+    } catch {
+      // Already gone.
+    }
+  }
+}
+
 const WORKER = `
 const { workerData, parentPort } = require("node:worker_threads");
 const fs = require("node:fs");
 const stallDecision = ${stallDecision.toString()};
+const killDescendants = ${killDescendants.toString()};
 const beat = new Float64Array(workerData.shared);
 const now = () => performance.timeOrigin + performance.now();
 const scratch = [];
@@ -59,6 +93,8 @@ setInterval(() => {
   try {
     fs.writeSync(2, "\\n[peeps] the runner's event loop has been blocked for " + Math.round((t - beat[0]) / 1000) + " s; closing the browser and exiting.\\n");
   } catch {}
+  // Chromium first: alive, it would recreate its profile after the rmSync.
+  try { killDescendants(workerData.pid, require("node:child_process").execFileSync); } catch {}
   for (const directory of scratch) {
     try { fs.rmSync(directory, { recursive: true, force: true }); } catch {}
   }

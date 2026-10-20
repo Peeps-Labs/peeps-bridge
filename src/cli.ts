@@ -159,6 +159,8 @@ export interface MainDeps {
   signal?: AbortSignal;
   /** Called once the browser is up, so a second Ctrl-C can close it at once. */
   onHost?: (host: BrowserHost) => void;
+  /** Called with the scratch directory as soon as it exists. */
+  onScratch?: (directory: string) => void;
   sleep?: (ms: number) => Promise<void>;
 }
 
@@ -203,7 +205,14 @@ export async function main(argv: string[], env: NodeJS.ProcessEnv, rawIo: Io, de
 
   let host: BrowserHost | null = null;
   try {
-    const hostOptions: BrowserHostOptions = { policy, secrets, version: VERSION, warn: print, ...(deps.tmpRoot ? { tmpRoot: deps.tmpRoot } : {}) };
+    const hostOptions: BrowserHostOptions = {
+      policy,
+      secrets,
+      version: VERSION,
+      warn: print,
+      ...(deps.tmpRoot ? { tmpRoot: deps.tmpRoot } : {}),
+      ...(deps.onScratch ? { onScratch: deps.onScratch } : {}),
+    };
     host = await startBrowserHost(hostOptions);
     deps.onHost?.(host);
     const end = await runBridgeSession({

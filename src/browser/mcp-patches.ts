@@ -73,6 +73,23 @@ export function dialogOpen(context: BrowserContext): boolean {
   return contexts.get(context)?.tabs().some((tab) => tab.modalStates().length > 0) ?? false;
 }
 
+const SHAPE = "peeps-bridge: @playwright/mcp's internals have changed shape";
+
+/** The function at `owner[key]`, or a startup error naming it. */
+export function patchable(owner: Record<string, unknown>, key: string, ownerName: string): (...args: never[]) => unknown {
+  const original = owner[key];
+  if (typeof original !== "function") throw new Error(`${SHAPE}: ${ownerName}.${key} is not a function`);
+  return original as (...args: never[]) => unknown;
+}
+
+/** The MCP backend's context, or an error if it is not the shape relied on. */
+export function assertMcpContext(context: unknown): asserts context is McpContext {
+  const c = context as Partial<Record<"currentTab" | "tabs", unknown>> | undefined;
+  if (typeof c?.currentTab !== "function" || typeof c?.tabs !== "function") {
+    throw new Error(`${SHAPE} (no context with currentTab and tabs)`);
+  }
+}
+
 function applyPatches(): void {
   if (applied) return;
   applied = true;
@@ -82,26 +99,25 @@ function applyPatches(): void {
     browserTools: { schema: { name: string }; handle: (context: unknown, params: unknown, response: unknown) => Promise<void> }[];
   };
 
+  patchable(exports.Tab.prototype, "_downloadStarted", "Tab");
   exports.Tab.prototype._downloadStarted = async function (download: { suggestedFilename(): string; cancel(): Promise<void>; page(): Page }) {
     await download.cancel().catch(() => {});
     sessions.get(download.page().context())?.onDownloadRefused(download.suggestedFilename());
   };
 
-  const initialize = exports.BrowserBackend.prototype.initialize as (this: { browserContext: BrowserContext; _context: McpContext }, ...args: unknown[]) => Promise<void>;
+  const initialize = patchable(exports.BrowserBackend.prototype, "initialize", "BrowserBackend") as unknown as (this: { browserContext: BrowserContext; _context: McpContext }, ...args: unknown[]) => Promise<void>;
   exports.BrowserBackend.prototype.initialize = async function (this: { browserContext: BrowserContext; _context: McpContext }, ...args: unknown[]) {
     await initialize.apply(this, args);
     // Fail loudly: without the context the runner cannot tell the active tab
     // or an open dialog, and secret-field tracking would quietly weaken.
-    if (typeof this._context?.currentTab !== "function" || typeof this._context?.tabs !== "function") {
-      throw new Error("peeps-bridge: @playwright/mcp's browser backend has changed shape (no context with currentTab and tabs)");
-    }
+    assertMcpContext(this._context);
     contexts.set(this.browserContext, this._context);
   };
 
   // Uploads are refused (no browser_file_upload), but a page's file chooser
   // would leave the tab in a modal state that only that tool clears. Cancel
   // the chooser instead, and say so in the next result.
-  const setModalState = exports.Tab.prototype.setModalState as (this: McpTab, state: { type: string; fileChooser?: { setFiles(files: string[]): Promise<void> } }) => void;
+  const setModalState = patchable(exports.Tab.prototype, "setModalState", "Tab") as unknown as (this: McpTab, state: { type: string; fileChooser?: { setFiles(files: string[]): Promise<void> } }) => void;
   exports.Tab.prototype.setModalState = function (this: McpTab, state: { type: string; fileChooser?: { setFiles(files: string[]): Promise<void> } }) {
     if (state.type !== "fileChooser") return setModalState.call(this, state);
     void state.fileChooser?.setFiles([]).catch(() => {});
@@ -109,7 +125,8 @@ function applyPatches(): void {
   };
 
   const network = exports.browserTools.find((tool) => tool.schema.name === "browser_network_requests");
-  if (!network) throw new Error("@playwright/mcp has no browser_network_requests to patch");
+  if (!network) throw new Error(`${SHAPE}: no browser_network_requests tool`);
+  patchable(network as unknown as Record<string, unknown>, "handle", "browser_network_requests");
   network.handle = async (context, params, response) => {
     const tab = await (context as { ensureTab(): Promise<McpTab> }).ensureTab();
     const r = response as McpResponse;

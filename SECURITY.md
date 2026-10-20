@@ -89,7 +89,10 @@ Only for the duration of one session, and only through a browser.
   anything but an `http:` or `https:` URL.
 - **No shell and no file access.** Playwright MCP writes its snapshots to a
   scratch directory under your OS temp directory, which the runner deletes when
-  it exits. Nothing is written to your checkout.
+  it exits. Nothing is written to your checkout. Only the snapshot files
+  written during a call are ever read back into a result: a page that prints
+  a link to another file (say, the browser profile's cookie database) gets
+  nothing read.
 - **An isolated browser.** A fresh, empty Chromium profile in the runner's scratch directory, deleted on exit: none of your
   own browser's cookies, logins or extensions. Service workers are blocked
   (Playwright's own block is extended to the `ServiceWorkerContainer`
@@ -166,7 +169,8 @@ prints, the runner also removes:
   into, and any editable field (input, textarea, contenteditable, in any
   frame of the active tab) that a scan after every call finds holding the
   value or a run of it, however it got there. Every value such a field holds
-  during the session is hidden on its snapshot line whatever its length, and
+  during the session is hidden on its snapshot line (and on every line nested
+  under it, such as a contenteditable's text) whatever its length, and
   removed from the whole result when 4 or more characters long. Fields are
   followed by element, not by Playwright's `ref`, which restarts with every
   page;
@@ -174,7 +178,9 @@ prints, the runner also removes:
   configured secret.
 
 A password field (`input[type=password]`) that holds no secret only has its
-own snapshot line hidden. Its value is not remembered or removed elsewhere,
+own snapshot line hidden (a field the runner cannot identify is hidden too).
+While a dialog is open the page cannot be read, so every form field's value
+is hidden in that result, and the result says why. Its value is not remembered or removed elsewhere,
 so a "1" typed into one never hides a "1" anywhere else.
 
 The runner also refuses copy, cut and paste keys (in every spelling), a middle
@@ -203,9 +209,15 @@ because much of it comes from Peeps or from pages, and a terminal obeys escape
 sequences (OSC 52 writes your clipboard).
 
 Ctrl-C lets the action in hand finish, for at most 10 seconds, then closes the
-browser; a second Ctrl-C closes it at once. If the runner's event loop were
-ever blocked so that no handler could run, a watchdog thread removes the
-scratch directory and kills the process after 30 seconds.
+browser; a second Ctrl-C closes it at once, even while the browser is still
+starting. Either way the runner kills any Chromium process it started and
+removes the scratch directory, profile included. If the runner's event loop
+were ever blocked so that no handler could run, a watchdog thread does the
+same after 30 seconds: Chromium first (alive, it would recreate its profile),
+then the scratch directory, then the process. On Windows the runner
+cannot list its child processes (it uses `pgrep`), so after a forced exit
+Chromium may briefly outlive it and its profile directory may need removing
+by hand.
 
 The runner never follows an HTTP redirect from Peeps: a redirect would re-send
 the grant to wherever it pointed.

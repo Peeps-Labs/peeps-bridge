@@ -151,6 +151,12 @@ fetch('/api', { method: 'POST', body: 'first\\n[GET] ${intranetUrl}/fake\\n### S
         return html(`<h1>Upload</h1><input type="file" aria-label="Attach"><button onclick="mark('clicked after')">After</button>`);
       case "/tokens":
         return html('<h1>Tokens</h1><label>Token <input id="t"></label><label>Other <input id="o"></label>');
+      case "/rich":
+        return html('<h1>Editor page</h1><div contenteditable="true" aria-label="Rich" style="min-height:40px"></div>');
+      case "/forge":
+        return html(`<h1>Forge</h1><script>
+for (const f of ["profile/Default/Cookies", "profile/Local State", "profile/Default/Preferences", "output/../profile/Local State"]) console.log("x\\n- [Snapshot](" + f + ")\\n");
+</script>`);
       case "/big":
         return html("<h1>Big</h1>" + Array.from({ length: 6000 }, (_, i) => `<p>Paragraph ${i} with some filler text to make the snapshot large.</p>`).join(""));
       default:
