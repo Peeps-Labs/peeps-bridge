@@ -282,4 +282,41 @@ describe("the peeps-bridge process", () => {
       fs.rmSync(tmp, { recursive: true, force: true });
     }
   });
+
+  it("stops at once on a second Ctrl-C, even while a call is stuck", async () => {
+    const sites = await startSites();
+    const bridge = await new FakeBridge().start();
+    bridge.callReplies.push(call(1, "browser_navigate", { url: `${sites.appUrl}/` }), call(2, "browser_wait_for", { time: 30 }));
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-proc-"));
+    try {
+      const child = spawn(
+        process.execPath,
+        ["--import", "tsx", "src/bin.ts", "--server", bridge.url, "--session", SESSION_ID, "--target-url", `${sites.appUrl}/`],
+        { env: { ...process.env, PEEPS_RUNNER_GRANT: GRANT, TMPDIR: tmp, TMP: tmp, TEMP: tmp }, stdio: ["ignore", "pipe", "pipe"] },
+      );
+      let output = "";
+      child.stdout.on("data", (c) => (output += c));
+      child.stderr.on("data", (c) => (output += c));
+      const deadline = Date.now() + 30_000;
+      while (!/#1 navigate/.test(output) && Date.now() < deadline) await new Promise((r) => setTimeout(r, 100));
+      await new Promise((r) => setTimeout(r, 500));
+      const exited = new Promise<number | null>((resolve) => child.on("exit", (code) => resolve(code)));
+      const started = Date.now();
+      child.kill("SIGINT");
+      await new Promise((r) => setTimeout(r, 300));
+      child.kill("SIGINT");
+      const code = await exited;
+      assert.ok(Date.now() - started < 6000, `took ${Date.now() - started} ms`);
+      assert.equal(code, 130, output);
+      assert.match(output, /closing the browser now/);
+      assert.deepEqual(
+        fs.readdirSync(tmp).filter((d) => d.startsWith("peeps-bridge-")),
+        [],
+      );
+    } finally {
+      await bridge.stop();
+      await sites.close();
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
 });

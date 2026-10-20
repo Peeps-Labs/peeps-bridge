@@ -110,6 +110,10 @@ export async function startBrowserHost(options: BrowserHostOptions): Promise<Bro
       chromium.launch({
         headless: true,
         chromiumSandbox,
+        // The runner decides what Ctrl-C does (finish the call in hand, then
+        // close); Playwright's own handler would kill the browser at once.
+        handleSIGINT: false,
+        handleSIGTERM: false,
         // Loopback through the proxy too: the target is usually localhost, and
         // so is much of what the policy must keep the browser away from.
         proxy: { server: proxy.url, bypass: "<-loopback>" },
@@ -175,7 +179,7 @@ export async function startBrowserHost(options: BrowserHostOptions): Promise<Bro
     const link = await McpLink.connect(server, workspace, options.version);
     cleanups.push(() => link.close());
 
-    let closed = false;
+    let closing: Promise<void> | null = null;
     return {
       workspace,
       browser,
@@ -199,10 +203,10 @@ export async function startBrowserHost(options: BrowserHostOptions): Promise<Bro
           },
         });
       },
-      async close() {
-        if (closed) return;
-        closed = true;
-        await cleanup();
+      close() {
+        // One cleanup, however many callers (Ctrl-C and the normal exit race).
+        closing ??= cleanup();
+        return closing;
       },
     };
   } catch (error) {
