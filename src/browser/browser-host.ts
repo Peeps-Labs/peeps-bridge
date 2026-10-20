@@ -1,0 +1,163 @@
+/**
+ * The browser this runner drives, and the Playwright MCP server that drives
+ * it, both in this process (design §6.6).
+ *
+ * The runner launches Chromium itself and owns its one BrowserContext, so it
+ * can police it: headless, an in-memory profile (never the person's own),
+ * every request through the origin proxy (`origin-proxy.ts`), `context.route`
+ * as the first check, service workers and downloads blocked. `@playwright/mcp`
+ * is hosted with `createConnection(config, () => context)` and works in a
+ * scratch directory under the OS temp dir, removed on close, so nothing it
+ * writes lands in the person's checkout.
+ *
+ * Settings mirror Peeps' cloud discovery (`agent-mcp-config.ts`): viewport
+ * 1366x768, navigation 15 s, actions 10 s, third-party cookies allowed. Image
+ * responses are omitted on top of that (pixels stay here, design §7.3).
+ */
+
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { createRequire } from "node:module";
+import { chromium, type Browser, type BrowserContext } from "playwright-core";
+
+import { McpLink, type McpServerLike } from "./mcp-link.js";
+import { OriginPolicy } from "./origin-policy.js";
+import { startOriginProxy, type OriginProxy } from "./origin-proxy.js";
+import { shapeResult, type TextResult } from "./results.js";
+import { makeScrubber, type Secrets } from "./secrets.js";
+
+const require = createRequire(import.meta.url);
+
+export const VIEWPORT = { width: 1366, height: 768 } as const;
+export const NAVIGATION_TIMEOUT_MS = 15_000;
+export const ACTION_TIMEOUT_MS = 10_000;
+
+export interface BrowserHostOptions {
+  policy: OriginPolicy;
+  secrets: Secrets;
+  /** The bridge package's version, for the MCP handshake. */
+  version: string;
+  /** Test seam: where the scratch directory goes. */
+  tmpRoot?: string;
+  warn?: (line: string) => void;
+}
+
+export interface BrowserHost {
+  /** The scratch directory the MCP server works in. */
+  readonly workspace: string;
+  readonly browser: Browser;
+  /** Whether Chromium runs inside its own sandbox. */
+  readonly sandboxed: boolean;
+  /** Run one already-allowed tool call and shape its result for Peeps. */
+  callTool(name: string, args: Record<string, unknown>): Promise<TextResult>;
+  scrub(text: string): string;
+  close(): Promise<void>;
+}
+
+const SERVICE_WORKER_BLOCK = `(() => {
+  if (typeof ServiceWorkerContainer === "undefined") return;
+  const refuse = () => Promise.reject(new DOMException("Service workers are blocked by peeps-bridge", "SecurityError"));
+  Object.defineProperty(ServiceWorkerContainer.prototype, "register", { value: refuse, writable: false, configurable: false });
+})();`;
+
+type CreateConnection = (config: object, contextGetter: () => Promise<BrowserContext>) => Promise<McpServerLike>;
+
+export async function startBrowserHost(options: BrowserHostOptions): Promise<BrowserHost> {
+  const { policy } = options;
+  const workspace = fs.mkdtempSync(path.join(options.tmpRoot ?? os.tmpdir(), "peeps-bridge-"));
+  const scrub = makeScrubber(options.secrets);
+  const blocked: string[] = [];
+  const cleanups: (() => Promise<unknown> | unknown)[] = [() => fs.rmSync(workspace, { recursive: true, force: true })];
+  const cleanup = async () => {
+    for (const step of cleanups.reverse()) {
+      try {
+        await step();
+      } catch {
+        // Keep going: every later step still has to run.
+      }
+    }
+  };
+
+  try {
+    const proxy: OriginProxy = await startOriginProxy(policy, (origin) => blocked.push(origin));
+    cleanups.push(() => proxy.close());
+
+    const launch = (chromiumSandbox: boolean) =>
+      chromium.launch({
+        headless: true,
+        chromiumSandbox,
+        // Loopback through the proxy too: the target is usually localhost, and
+        // so is much of what the policy must keep the browser away from.
+        proxy: { server: proxy.url, bypass: "<-loopback>" },
+        args: ["--disable-features=ThirdPartyCookieBlocking"],
+      });
+    // Chromium's own sandbox where the OS allows it (Playwright turns it off
+    // by default). Some Linux setups forbid the user namespaces it needs.
+    let sandboxed = true;
+    let browser: Browser;
+    try {
+      browser = await launch(true);
+    } catch (error) {
+      if (!/sandbox/i.test(String(error))) throw error;
+      sandboxed = false;
+      options.warn?.("Chromium's sandbox is not available on this machine (common on Linux without unprivileged user namespaces); running without it.");
+      browser = await launch(false);
+    }
+    cleanups.push(() => browser.close());
+
+    const context = await browser.newContext({
+      viewport: VIEWPORT,
+      serviceWorkers: "block",
+      acceptDownloads: false,
+    });
+    cleanups.push(() => context.close());
+    // Playwright's `serviceWorkers: "block"` only replaces `register` on the
+    // `navigator.serviceWorker` instance, which a page bypasses through
+    // `ServiceWorkerContainer.prototype.register` (tested). Refuse there too.
+    await context.addInitScript(SERVICE_WORKER_BLOCK);
+    // The fast first check, with a clear refusal; the proxy is the real one
+    // (this does not see redirects).
+    await context.route("**/*", async (route) => {
+      const url = route.request().url();
+      if (policy.allowsUrl(url)) return route.fallback();
+      blocked.push(OriginPolicy.originOf(url));
+      return route.abort("blockedbyclient");
+    });
+
+    const { createConnection } = require("@playwright/mcp") as { createConnection: CreateConnection };
+    const server = await createConnection(
+      {
+        browser: { browserName: "chromium", isolated: false },
+        outputDir: path.join(workspace, "output"),
+        secrets: options.secrets,
+        imageResponses: "omit",
+        timeouts: { navigation: NAVIGATION_TIMEOUT_MS, action: ACTION_TIMEOUT_MS },
+      },
+      async () => context,
+    );
+    const link = await McpLink.connect(server, workspace, options.version);
+    cleanups.push(() => link.close());
+
+    let closed = false;
+    return {
+      workspace,
+      browser,
+      sandboxed,
+      scrub,
+      async callTool(name, args) {
+        blocked.length = 0;
+        const raw = await link.callTool(name, args);
+        return shapeResult(raw, { workspace, scrub, blocked: [...blocked] });
+      },
+      async close() {
+        if (closed) return;
+        closed = true;
+        await cleanup();
+      },
+    };
+  } catch (error) {
+    await cleanup();
+    throw error;
+  }
+}
