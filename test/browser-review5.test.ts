@@ -86,6 +86,29 @@ describe("a call that never ends", () => {
   });
 });
 
+describe("the call deadline", () => {
+  it("covers the runner's own field reads, not only the browser call", async () => {
+    const inputs = Array.from({ length: 1500 }, (_, i) => `<label>F${i} <input value="v${i}"></label>`).join("");
+    const http = await import("node:http");
+    const server = http.createServer((_q, r) => r.writeHead(200, { "content-type": "text/html" }).end(inputs));
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    const url = `http://localhost:${(server.address() as import("node:net").AddressInfo).port}/`;
+    let stuck = 0;
+    const host = await startBrowserHost({ policy: OriginPolicy.from(url, []), secrets: {}, version: "test", tmpRoot, callDeadlineMs: 2500, onStuck: () => (stuck += 1) });
+    try {
+      const started = Date.now();
+      const result = await host.callTool("browser_navigate", { url });
+      assert.ok(Date.now() - started < 4000, `took ${Date.now() - started} ms`);
+      assert.equal(result.isError, true);
+      assert.match(result.content[0]!.text, /did not finish within 3 s|did not finish within 2 s/);
+      assert.equal(stuck, 1);
+    } finally {
+      await host.close();
+      server.close();
+    }
+  });
+});
+
 describe("the dialog note", () => {
   it("has its own heading, not Blocked", async () => {
     const s = await session(sites.appUrl, {}, tmpRoot);

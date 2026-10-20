@@ -222,6 +222,42 @@ export async function startBrowserHost(options: BrowserHostOptions): Promise<Bro
     cleanups.push(() => link.close());
 
     let closing: Promise<void> | null = null;
+    const runCall = async (name: string, rawArgs: Record<string, unknown>): Promise<TextResult> => {
+      blocked.length = 0;
+      const tracked = fields!;
+      let args = rawArgs;
+      if (name === "browser_type" && args.slowly && tracked.secretRefs(name, args).length > 0) {
+        // One fill: typed one character at a time, a page sees (and can log)
+        // every prefix of the secret.
+        const { slowly: _slowly, ...rest } = args;
+        args = rest;
+      }
+      if (name === "browser_drag" && (await tracked.isSensitive(String(args.startRef)))) {
+        return {
+          content: [{ type: "text", text: "browser_drag was refused by the runner: dragging from a field holding a secret or a password could move its text where it is not hidden." }],
+          isError: true,
+        };
+      }
+      await tracked.before(name, args);
+      const before = snapshotFiles(output);
+      const raw = await link.callTool(name, args);
+      // Only snapshot files @playwright/mcp wrote during this call may be
+      // inlined: a link in the text is not authority to read a file.
+      const written = new Set([...snapshotFiles(output)].filter(([file, mtime]) => before.get(file) !== mtime).map(([file]) => file));
+      const text = collectText(raw, workspace, written);
+      await tracked.refresh(text ?? "");
+      const blind = tracked.blindReason();
+      const refused = notes.splice(0);
+      const runs = EVERYWHERE.has(name) ? "everywhere" : "fields";
+      return shapeResult(text === null ? raw : { content: [{ type: "text", text }], isError: raw.isError }, {
+        workspace,
+        scrub: (text) => scrubSecrets(text, { extraValues: tracked.scrubbable(), runs }),
+        blocked: [...blocked],
+        notes: refused,
+        info: blind ? [blind] : [],
+        transform: (text) => tracked.mask(text),
+      });
+    };
     return {
       workspace,
       browser,
@@ -230,54 +266,22 @@ export async function startBrowserHost(options: BrowserHostOptions): Promise<Bro
       scrub,
       scratchPaths: () => [...scratch],
       async callTool(name, rawArgs) {
-        blocked.length = 0;
-        const tracked = fields!;
-        let args = rawArgs;
-        if (name === "browser_type" && args.slowly && tracked.secretRefs(name, args).length > 0) {
-          // One fill: typed one character at a time, a page sees (and can log)
-          // every prefix of the secret.
-          const { slowly: _slowly, ...rest } = args;
-          args = rest;
-        }
-        if (name === "browser_drag" && (await tracked.isSensitive(String(args.startRef)))) {
-          return {
-            content: [{ type: "text", text: "browser_drag was refused by the runner: dragging from a field holding a secret or a password could move its text where it is not hidden." }],
-            isError: true,
-          };
-        }
-        await tracked.before(name, args);
-        const before = snapshotFiles(output);
+        // The deadline covers the whole call: the runner's own reads of the
+        // page (tracking, drag checks, masking) as well as the browser's.
         const deadlineMs = options.callDeadlineMs ?? CALL_DEADLINE_MS;
         let timer: NodeJS.Timeout | undefined;
-        const raw = await Promise.race([
-          link.callTool(name, args),
+        const result = await Promise.race([
+          runCall(name, rawArgs),
           new Promise<null>((resolve) => {
             timer = setTimeout(() => resolve(null), deadlineMs);
           }),
         ]).finally(() => clearTimeout(timer));
-        if (raw === null) {
-          options.onStuck?.();
-          return {
-            content: [{ type: "text", text: `${name} did not finish within ${Math.round(deadlineMs / 1000)} s: the page is not responding. The runner is closing the browser and ending this session.` }],
-            isError: true,
-          };
-        }
-        // Only snapshot files @playwright/mcp wrote during this call may be
-        // inlined: a link in the text is not authority to read a file.
-        const written = new Set([...snapshotFiles(output)].filter(([file, mtime]) => before.get(file) !== mtime).map(([file]) => file));
-        const text = collectText(raw, workspace, written);
-        await tracked.refresh(text ?? "");
-        const blind = tracked.blindReason();
-        const refused = notes.splice(0);
-        const runs = EVERYWHERE.has(name) ? "everywhere" : "fields";
-        return shapeResult(text === null ? raw : { content: [{ type: "text", text }], isError: raw.isError }, {
-          workspace,
-          scrub: (text) => scrubSecrets(text, { extraValues: tracked.scrubbable(), runs }),
-          blocked: [...blocked],
-          notes: refused,
-          info: blind ? [blind] : [],
-          transform: (text) => tracked.mask(text),
-        });
+        if (result !== null) return result;
+        options.onStuck?.();
+        return {
+          content: [{ type: "text", text: `${name} did not finish within ${Math.round(deadlineMs / 1000)} s: the page is not responding. The runner is closing the browser and ending this session.` }],
+          isError: true,
+        };
       },
       close() {
         // One cleanup, however many callers (Ctrl-C and the normal exit race).

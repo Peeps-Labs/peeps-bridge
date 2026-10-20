@@ -42,6 +42,22 @@ const EDITABLE_ROLES = new Set(["textbox", "searchbox", "combobox", "spinbutton"
 const EDITABLE = "input:not([type=hidden]), textarea, [contenteditable]:not([contenteditable=false])";
 
 
+/** How a bounded read ended: an answer, a refusal, or no answer in time. */
+type Settled<T> = { kind: "ok"; value: T } | { kind: "error" } | { kind: "timeout" };
+
+function settle<T>(promise: Promise<T>, ms = READ_TIMEOUT_MS): Promise<Settled<T>> {
+  let timer: NodeJS.Timeout | undefined;
+  return Promise.race([
+    promise.then(
+      (value): Settled<T> => ({ kind: "ok", value }),
+      (): Settled<T> => ({ kind: "error" }),
+    ),
+    new Promise<Settled<T>>((resolve) => {
+      timer = setTimeout(() => resolve({ kind: "timeout" }), ms);
+    }),
+  ]).finally(() => clearTimeout(timer));
+}
+
 /** A promise's value, or `fallback` once it rejects or takes too long. */
 export function bounded<T>(promise: Promise<T>, fallback: T, ms = READ_TIMEOUT_MS): Promise<T> {
   let timer: NodeJS.Timeout | undefined;
@@ -155,10 +171,18 @@ export class SecretFields {
 
     const alive: Tracked[] = [];
     for (const t of this.tracked) {
-      const value = await bounded(t.handle.evaluate(readValue), null as string | null);
-      if (value === null && (t.page.isClosed() || !(await bounded(t.handle.evaluate(() => true), false)))) continue;
+      const read = await settle(t.handle.evaluate(readValue));
+      // Dropped only when confirmed gone: the page closed, or Playwright says
+      // the element cannot be reached (its document or frame went away). A
+      // read that only timed out (the page was busy) keeps the entry, and its
+      // line is hidden this time.
+      if (t.page.isClosed() || read.kind === "error") continue;
       alive.push(t);
-      if (value) this.history.add(value);
+      if (read.kind === "timeout") {
+        if (t.lastRef) this.hiddenRefs.add(t.lastRef);
+        continue;
+      }
+      if (read.value) this.history.add(read.value);
     }
     this.tracked = alive;
 

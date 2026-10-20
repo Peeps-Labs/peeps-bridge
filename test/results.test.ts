@@ -201,6 +201,61 @@ describe("snapshot lines with YAML-quoted keys", () => {
   });
 });
 
+describe("SecretFields and a page that is busy for a moment", () => {
+  /** A fake page whose one field's reads hang while `busy`, then answer. */
+  function fakePage() {
+    const state = { busy: true, gone: false, value: "Zq8vK" };
+    const handle = {
+      evaluate: (fn: unknown) => {
+        if (state.gone) return Promise.reject(new Error("Execution context was destroyed"));
+        if (state.busy) return new Promise(() => {});
+        // readValue, a liveness check, or an identity comparison.
+        return Promise.resolve(String(fn).includes("===") ? true : String(fn).includes("isContentEditable") ? state.value : true);
+      },
+      ownerFrame: () => Promise.resolve(null),
+      dispose: () => Promise.resolve(),
+    };
+    const page = {
+      locator: () => ({ elementHandle: () => Promise.resolve(handle), evaluateAll: () => Promise.resolve([]), nth: () => ({ elementHandle: () => Promise.resolve(null) }) }),
+      frames: () => [],
+      isClosed: () => false,
+    };
+    return { state, context: { pages: () => [page] } as never };
+  }
+
+  it("keeps tracking a field whose reads time out, and reads it once the page is free", async () => {
+    const { state, context } = fakePage();
+    const fields = new SecretFields(context, { PW: "Zq8vK3mW9xT2" });
+    await fields.before("browser_type", { ref: "e3", text: "PW" });
+    await fields.refresh("");
+    state.busy = false;
+    await fields.refresh("");
+    assert.deepEqual(fields.scrubbable(), ["Zq8vK"]);
+  });
+
+  it("hides the field's line while its read is inconclusive", async () => {
+    const { context } = fakePage();
+    const fields = new SecretFields(context, { PW: "Zq8vK3mW9xT2" });
+    await fields.before("browser_type", { ref: "e3", text: "PW" });
+    const text = '- textbox "A" [ref=e3]: Zq8';
+    await fields.refresh(text);
+    assert.equal(fields.mask(text), '- textbox "A" [ref=e3]: [hidden by peeps-bridge]');
+  });
+
+  it("stops tracking a field only once it is confirmed gone", async () => {
+    const { state, context } = fakePage();
+    const fields = new SecretFields(context, { PW: "Zq8vK3mW9xT2" });
+    await fields.before("browser_type", { ref: "e3", text: "PW" });
+    state.busy = false;
+    state.gone = true;
+    await fields.refresh("");
+    state.gone = false;
+    state.value = "later-value";
+    await fields.refresh("");
+    assert.deepEqual(fields.scrubbable(), []);
+  });
+});
+
 describe("SecretFields failing closed", () => {
   it("hides an editable field's value when its ref cannot be resolved", async () => {
     const page = {
