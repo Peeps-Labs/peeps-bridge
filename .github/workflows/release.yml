@@ -1,0 +1,62 @@
+name: Release
+
+# Publishes @peepsai/bridge to npm when a version tag is pushed: `git tag v0.1.0
+# && git push origin v0.1.0` on a commit of main whose package.json says 0.1.0.
+# Every publish carries a provenance attestation that links the package to this
+# workflow run and its commit.
+#
+# Authentication: npm trusted publishing (OIDC, no stored token) once it is
+# configured for the package on npmjs.com. The package's very first publish
+# happens before that setting can exist, so it uses an NPM_TOKEN repository
+# secret instead; delete the secret once trusted publishing is configured.
+
+on:
+  push:
+    tags: ["v*.*.*"]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    name: Publish to npm
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write # OIDC for trusted publishing and provenance
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          fetch-depth: 0 # the "tag is on main" check walks history
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 24
+          registry-url: https://registry.npmjs.org
+      # Trusted publishing needs npm 11.5.1 or later.
+      - run: npm install -g npm@^11.5.1
+      - name: Tag matches package.json
+        run: |
+          version="$(node -p "require('./package.json').version")"
+          if [ "v$version" != "$GITHUB_REF_NAME" ]; then
+            echo "::error::tag $GITHUB_REF_NAME does not match package.json version $version"
+            exit 1
+          fi
+      - name: Tag is on main
+        run: |
+          git merge-base --is-ancestor "$GITHUB_SHA" origin/main || {
+            echo "::error::$GITHUB_REF_NAME is not on main"
+            exit 1
+          }
+      - run: npm ci
+      - name: Install Chromium
+        run: npx -y playwright-core@"$(node -p "require('playwright-core/package.json').version")" install --with-deps --only-shell chromium
+      - run: npm run lint
+      - run: npm run typecheck
+      - run: npm test
+      - run: npm publish --provenance --access public
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}

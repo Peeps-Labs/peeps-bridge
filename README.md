@@ -158,6 +158,17 @@ npm run test:coverage   # with thresholds
 Tests use Node's own runner with `tsx`. The browser tests launch real
 Chromium against small local servers.
 
+## Releasing
+
+1. On a branch, set the version in `package.json` and date its section in
+   `CHANGELOG.md`; merge to `main`.
+2. Tag that commit of `main` and push the tag: `git tag v0.2.0 && git push
+   origin v0.2.0`.
+
+The `Release` workflow checks that the tag matches `package.json` and is on
+`main`, runs lint, the type check and the tests, and publishes to npm with a
+provenance attestation.
+
 ## License
 
 MIT
