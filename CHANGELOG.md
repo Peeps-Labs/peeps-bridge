@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.1.1 (2026-10-22)
+
+- Stopping the runner ends the session at Peeps at once (PQA-2427). On
+  Ctrl-C, SIGTERM or SIGHUP (or when a stuck browser call makes the runner
+  stop), after the call in hand is answered and before the browser closes,
+  the runner sends one `POST /api/v1/bridge/sessions/<id>/detach` with its
+  grant and `x-peeps-runner-instance`, following no redirect, with at most 3
+  seconds for the whole of it (the grant lookup included). A forced stop (the
+  10-second deadline, or a second Ctrl-C) sends it alongside closing the
+  browser, with the call possibly still in hand, and exits after at most 3
+  seconds either way. It is sent at most once per session, and never after
+  the runner itself left for a 410, an expiry or lost contact. Whatever Peeps
+  answers (a refusal, a network error, a timeout) is one log line and the
+  runner exits anyway. It is best effort: when a detach does not arrive,
+  Peeps presumes the runner gone after 3 minutes of silence, as before.
+- `@peepsai/bridge/protocol`: `runBridgeSession` takes `detachOnStop` (off by
+  default; Peeps refuses a detach from CI), `exposeDetach` (the same
+  once-only detach, for a forced exit) and a `detachTimeoutMs` seam.
+
 ## 0.1.0 (2026-10-21)
 
 First release: the runner for Peeps local discovery (PQA-2314).

@@ -15,7 +15,7 @@ the grant for one session, and runs it.
 ## The command
 
 ```sh
-PEEPS_RUNNER_GRANT=<grant> npx -y @peepsai/bridge@0.1.0 \
+PEEPS_RUNNER_GRANT=<grant> npx -y @peepsai/bridge@0.1.1 \
   --server https://app.peepsai.com \
   --session <session id> \
   --target-url http://localhost:3000 \
@@ -35,7 +35,7 @@ PEEPS_RUNNER_GRANT=<grant> npx -y @peepsai/bridge@0.1.0 \
 While it runs you see one line per action:
 
 ```
-[peeps] peeps-bridge 0.1.0: serving session 6f1c… for https://app.peepsai.com
+[peeps] peeps-bridge 0.1.1: serving session 6f1c… for https://app.peepsai.com
 [peeps] the browser may reach: http://localhost:3000
 [peeps] attached to session 6f1c… (discover); it expires at 2026-10-20T15:45:00.000Z
 [peeps] #1 navigate to http://localhost:3000/ on /
@@ -47,9 +47,14 @@ Check the `the browser may reach:` line: those origins, and nothing else, are
 what the browser can open.
 
 Press Ctrl-C to stop. The action in progress finishes (for at most 10
-seconds), the browser closes and the runner exits, removing its scratch
-directory and the browser profile in it. Press it again to close the browser
-at once.
+seconds), the runner tells Peeps it is leaving so the session ends at once
+(waiting at most 3 seconds for an answer), the browser closes and the runner
+exits, removing its scratch directory and the browser profile in it. Press it
+again to close the browser at once. If the action does not finish in those 10
+seconds, or you press Ctrl-C twice, the runner still tries to tell Peeps
+while it closes the browser, but gives up after 3 seconds; if Peeps is not
+told (no network, say), it presumes the runner gone once it has been silent
+for 3 minutes.
 
 ## What it can and cannot do
 
@@ -131,7 +136,10 @@ See [SECURITY.md](SECURITY.md) for the detail.
 `@peepsai/bridge/protocol` is the runner side of Peeps' agent bridge with no
 browser in it: attach, long-poll for calls, post results, back off on
 transport errors, and stop on 410, expiry, eight consecutive transport errors
-or an abort signal. `peeps-action`'s CI agent is meant to use it too.
+or an abort signal. With `detachOnStop: true` (a local runner's; Peeps
+refuses it for CI) a stop by the signal also tells Peeps, at most once, so
+the session ends at once; `exposeDetach` hands the caller the same once-only
+detach for a forced exit that cannot wait for the call in hand. `peeps-action`'s CI agent is meant to use it too.
 
 ```ts
 import { runBridgeSession } from "@peepsai/bridge/protocol";

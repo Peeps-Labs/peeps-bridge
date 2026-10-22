@@ -54,7 +54,7 @@ Options:
 Environment:
   PEEPS_RUNNER_GRANT              The session's grant (never pass it as an argument)
 
-Ctrl-C stops the runner and closes its browser.`;
+Ctrl-C stops the runner, ends the session at Peeps and closes its browser.`;
 
 export type Cli =
   | { kind: "help" }
@@ -161,6 +161,11 @@ export interface MainDeps {
   onHost?: (host: BrowserHost) => void;
   /** Called with the scratch directory as soon as it exists. */
   onScratch?: (directory: string) => void;
+  /**
+   * Called with the session's once-only `detachNow`, so a forced stop can
+   * still tell Peeps the runner is leaving while a call is in hand.
+   */
+  onDetach?: (detachNow: () => Promise<void>) => void;
   /** Test seam: the per-call deadline. */
   callDeadlineMs?: number;
   sleep?: (ms: number) => Promise<void>;
@@ -236,6 +241,9 @@ export async function main(argv: string[], env: NodeJS.ProcessEnv, rawIo: Io, de
       handle: createCallHandler({ host, policy, secretNames: new Set(Object.keys(secrets)), print }),
       log: (line) => print(host ? host.scrub(line) : line),
       signal,
+      // Ctrl-C (or a stuck browser) ends the session at Peeps at once.
+      detachOnStop: true,
+      ...(deps.onDetach ? { exposeDetach: deps.onDetach } : {}),
       ...(deps.sleep ? { sleep: deps.sleep } : {}),
     });
     if (stuck) {

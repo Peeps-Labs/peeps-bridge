@@ -210,16 +210,30 @@ Peeps drives. Control characters are stripped from everything it prints,
 because much of it comes from Peeps or from pages, and a terminal obeys escape
 sequences (OSC 52 writes your clipboard).
 
-Ctrl-C lets the action in hand finish, for at most 10 seconds, then closes the
-browser; a second Ctrl-C closes it at once, even while the browser is still
-starting. Either way the runner kills any Chromium process it started and
+Ctrl-C lets the action in hand finish, for at most 10 seconds, tells Peeps
+the runner is leaving, then closes the browser; a second Ctrl-C closes it at
+once, even while the browser is still starting. SIGTERM and SIGHUP stop it
+the same way.
+
+Telling Peeps is one `POST …/detach` carrying the grant in its
+`Authorization` header, following no redirect and not retried, with at most
+3 seconds for the whole of it. It is sent at most once per session, and never
+after the runner has itself left because Peeps ended the session, the
+session expired or Peeps could not be reached. When the stop is forced (the
+10 seconds ran out or Ctrl-C was pressed twice) it is sent alongside closing
+the browser, with the call possibly still in hand, and the runner exits
+within 3 seconds whether or not Peeps answered. It is best effort: if it
+does not arrive, Peeps presumes the runner gone once it has been silent for
+3 minutes.
+
+However it stops, the runner kills any Chromium process it started and
 removes the scratch directory, profile included. If the runner's event loop
 were ever blocked so that no handler could run, a watchdog thread does the
-same after 30 seconds: Chromium first (alive, it would recreate its profile),
-then the scratch directory, then the process. On Windows the runner
-cannot list its child processes (it uses `pgrep`), so after a forced exit
-Chromium may briefly outlive it and its profile directory may need removing
-by hand.
+same after 30 seconds: Chromium first (alive, it would recreate its
+profile), then the scratch directory, then the process. On Windows the
+runner cannot list its child processes (it uses `pgrep`), so after a forced
+exit Chromium may briefly outlive it and its profile directory may need
+removing by hand.
 
 One browser call may take at most 90 seconds. Some operations have no
 timeout of their own (listing tabs reads each page's title, which a page stuck

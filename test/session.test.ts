@@ -361,3 +361,290 @@ describe("redirects", () => {
     }
   });
 });
+
+describe("detach on stop", () => {
+  const GRANT_TEXT = "b1.123.abc";
+  /** A local runner that stops once call 1 is in hand, or while idle. */
+  const stopping = (overrides: Partial<BridgeSessionOptions> = {}) => {
+    const controller = new AbortController();
+    return {
+      controller,
+      options: options({
+        detachOnStop: true,
+        signal: controller.signal,
+        handle: async () => {
+          controller.abort();
+          return { ok: true, result: { content: [{ type: "text", text: "done" }] } };
+        },
+        ...overrides,
+      }),
+    };
+  };
+
+  it("tells Peeps once, with the grant and the instance header, after the call in hand is answered", async () => {
+    bridge.callReplies.push(call(1));
+    const { options: o } = stopping();
+    const end = await runBridgeSession(o);
+    assert.deepEqual(end, { reason: "stopped", handled: 1 });
+    const detaches = bridge.of("detach");
+    assert.equal(detaches.length, 1);
+    const [detach] = detaches;
+    assert.equal(detach!.method, "POST");
+    assert.equal(detach!.path, `/api/v1/bridge/sessions/${SESSION_ID}/detach`);
+    assert.equal(detach!.headers.authorization, `Bearer ${GRANT_TEXT}`);
+    assert.equal(detach!.headers["x-peeps-runner-instance"], INSTANCE);
+    // After the result of the call in hand, and nothing after it.
+    assert.deepEqual(
+      bridge.requests.map((r) => r.path.split("/").pop()),
+      ["attach", "calls?wait=25", "result", "detach"],
+    );
+    assert.ok(lines.some((l) => /Peeps ended the session/.test(l)), lines.join("\n"));
+  });
+
+  it("tells Peeps when stopped while idle, cancelling the long poll", async () => {
+    bridge.callReplies.push({ status: 204, delayMs: 5000 });
+    const { controller, options: o } = stopping();
+    setTimeout(() => controller.abort(), 100);
+    const started = Date.now();
+    const end = await runBridgeSession(o);
+    assert.equal(end.reason, "stopped");
+    assert.equal(bridge.of("detach").length, 1);
+    assert.ok(Date.now() - started < 2000);
+  });
+
+  it("says when the session was already over at Peeps", async () => {
+    bridge.callReplies.push(call(1));
+    bridge.detachReplies.push({ status: 200, body: { sessionId: SESSION_ID, status: "already_over" } });
+    await runBridgeSession(stopping().options);
+    assert.ok(lines.some((l) => /already over/.test(l)), lines.join("\n"));
+  });
+
+  it("is not sent unless the caller asks (a CI runner, which Peeps refuses with local_runner_only)", async () => {
+    bridge.callReplies.push(call(1));
+    const { options: o } = stopping({ detachOnStop: undefined });
+    assert.equal((await runBridgeSession(o)).reason, "stopped");
+    assert.equal(bridge.of("detach").length, 0);
+  });
+
+  for (const [status, error] of [
+    [401, "invalid_token"],
+    [400, "invalid_runner_instance"],
+    [409, "other_runner"],
+    [404, "not_found"],
+    [403, "local_runner_only"],
+  ] as const) {
+    it(`logs one line for a ${status} ${error} and still stops`, async () => {
+      bridge.callReplies.push(call(1));
+      bridge.detachReplies.push({ status, body: { error } });
+      const end = await runBridgeSession(stopping().options);
+      assert.deepEqual(end, { reason: "stopped", handled: 1 });
+      assert.equal(bridge.of("detach").length, 1);
+      const said = lines.filter((l) => /end the session/i.test(l));
+      assert.equal(said.length, 1, lines.join("\n"));
+      assert.match(said[0]!, new RegExp(`${status} ${error}`));
+      assert.doesNotMatch(lines.join("\n"), new RegExp(GRANT_TEXT.replace(/\./g, "\\.")));
+    });
+  }
+
+  it("logs one line for a network error and still stops, without retrying", async () => {
+    bridge.callReplies.push(call(1));
+    bridge.detachReplies.push("drop");
+    const end = await runBridgeSession(stopping().options);
+    assert.equal(end.reason, "stopped");
+    assert.equal(bridge.of("detach").length, 1);
+    const said = lines.filter((l) => /end the session/i.test(l));
+    assert.equal(said.length, 1, lines.join("\n"));
+    assert.doesNotMatch(lines.join("\n"), /b1\.123\.abc/);
+  });
+
+  it("gives up on a detach that does not answer within its short timeout", async () => {
+    bridge.callReplies.push(call(1));
+    bridge.detachReplies.push({ status: 200, body: { status: "ended" }, delayMs: 5000 });
+    const started = Date.now();
+    const end = await runBridgeSession(stopping({ detachTimeoutMs: 300 }).options);
+    assert.equal(end.reason, "stopped");
+    assert.ok(Date.now() - started < 2000, `took ${Date.now() - started} ms`);
+    const said = lines.filter((l) => /end the session/i.test(l));
+    assert.equal(said.length, 1, lines.join("\n"));
+    assert.match(said[0]!, /no answer within/);
+  });
+
+  it("defaults to a short timeout, far under the 10-second stop deadline", async () => {
+    bridge.callReplies.push(call(1));
+    bridge.detachReplies.push({ status: 200, body: { status: "ended" }, delayMs: 8000 });
+    const started = Date.now();
+    await runBridgeSession(stopping().options);
+    const took = Date.now() - started;
+    assert.ok(took < 5000, `took ${took} ms`);
+  });
+
+  it("never follows a redirect on detach", async () => {
+    const elsewhere = await new FakeBridge().start();
+    try {
+      bridge.callReplies.push(call(1));
+      bridge.detachReplies.push({ status: 307, body: {}, headers: { location: `${elsewhere.url}/api/v1/bridge/sessions/${SESSION_ID}/detach` } });
+      const end = await runBridgeSession(stopping().options);
+      assert.equal(end.reason, "stopped");
+      assert.equal(elsewhere.requests.length, 0);
+      assert.equal(lines.filter((l) => /end the session/i.test(l)).length, 1, lines.join("\n"));
+    } finally {
+      await elsewhere.stop();
+    }
+  });
+
+  it("is not sent after a 410 on a poll or on the result of the call in hand", async () => {
+    bridge.callReplies.push({ status: 410, body: { error: "session_over" } });
+    assert.equal((await runBridgeSession(options({ detachOnStop: true }))).reason, "session_over");
+
+    bridge.callReplies.push(call(1));
+    bridge.resultReplies.push({ status: 410, body: { error: "session_over" } });
+    assert.equal((await runBridgeSession(stopping().options)).reason, "session_over");
+    assert.equal(bridge.of("detach").length, 0);
+  });
+
+  it("is not sent after the session expired", async () => {
+    bridge.attachReplies.push({ status: 200, body: { sessionId: SESSION_ID, kind: "discover", expiresAt: "2000-01-01T00:00:00Z" } });
+    assert.equal((await runBridgeSession(options({ detachOnStop: true }))).reason, "expired");
+    assert.equal(bridge.of("detach").length, 0);
+  });
+
+  it("is not sent after lost contact", async () => {
+    bridge.callReplies.push(...Array.from({ length: 8 }, () => "drop" as const));
+    assert.equal((await runBridgeSession(options({ detachOnStop: true }))).reason, "lost_contact");
+    assert.equal(bridge.of("detach").length, 0);
+  });
+
+  it("is not sent after Peeps refused the runner, or before it attached", async () => {
+    bridge.callReplies.push({ status: 401, body: { error: "invalid_token" } });
+    await runBridgeSession(options({ detachOnStop: true })).catch(() => {});
+
+    const controller = new AbortController();
+    controller.abort();
+    await runBridgeSession(options({ detachOnStop: true, signal: controller.signal }));
+    assert.equal(bridge.of("detach").length, 0);
+  });
+});
+
+describe("detach deadline and detachNow", () => {
+  it("bounds the whole detach, the authorization lookup included, by its timeout", async () => {
+    bridge.callReplies.push(call(1));
+    const controller = new AbortController();
+    const started = Date.now();
+    const end = await runBridgeSession(
+      options({
+        detachOnStop: true,
+        detachTimeoutMs: 300,
+        signal: controller.signal,
+        // Fine until the call in hand is answered; then it never answers.
+        authorization: () => (bridge.of("result").length > 0 ? new Promise<string>(() => {}) : "Bearer b1.123.abc"),
+        handle: async () => {
+          controller.abort();
+          return { ok: true, result: {} };
+        },
+      }),
+    );
+    assert.equal(end.reason, "stopped");
+    assert.ok(Date.now() - started < 2000, `took ${Date.now() - started} ms`);
+    const said = lines.filter((l) => /end the session/i.test(l));
+    assert.equal(said.length, 1, lines.join("\n"));
+    assert.match(said[0]!, /no answer within 0\.3 s/);
+  });
+
+  it("logs a 200 with an unknown status neutrally", async () => {
+    bridge.callReplies.push(call(1));
+    bridge.detachReplies.push({ status: 200, body: { status: "something_new" } });
+    const controller = new AbortController();
+    await runBridgeSession(
+      options({
+        detachOnStop: true,
+        signal: controller.signal,
+        handle: async () => {
+          controller.abort();
+          return { ok: true, result: {} };
+        },
+      }),
+    );
+    assert.ok(!lines.some((l) => /Peeps ended the session/.test(l)), lines.join("\n"));
+    assert.ok(lines.some((l) => /Peeps answered/.test(l)), lines.join("\n"));
+  });
+
+  /** A session whose call 1 waits until released; `detachNow` exposed. */
+  function held(extra: Partial<BridgeSessionOptions> = {}) {
+    let detachNow: (() => Promise<void>) | null = null;
+    let release!: () => void;
+    const released = new Promise<void>((r) => (release = r));
+    let inHand!: () => void;
+    const handling = new Promise<void>((r) => (inHand = r));
+    const controller = new AbortController();
+    const run = runBridgeSession(
+      options({
+        detachOnStop: true,
+        signal: controller.signal,
+        exposeDetach: (d) => (detachNow = d),
+        handle: async () => {
+          inHand();
+          await released;
+          return { ok: true, result: {} };
+        },
+        ...extra,
+      }),
+    );
+    return { run, controller, release, handling, detachNow: () => detachNow!() };
+  }
+
+  it("detachNow tells Peeps while a call is still in hand, and the stop that follows sends no second one", async () => {
+    bridge.callReplies.push(call(1));
+    const s = held();
+    await s.handling;
+    s.controller.abort();
+    await s.detachNow();
+    assert.equal(bridge.of("detach").length, 1);
+    assert.equal(bridge.of("result").length, 0, "sent with the call still outstanding");
+    s.release();
+    assert.equal((await s.run).reason, "stopped");
+    await s.detachNow();
+    assert.equal(bridge.of("detach").length, 1);
+  });
+
+  it("detachNow called twice at once sends one", async () => {
+    bridge.callReplies.push(call(1));
+    bridge.detachReplies.push({ status: 200, body: { status: "ended" }, delayMs: 200 });
+    const s = held();
+    await s.handling;
+    await Promise.all([s.detachNow(), s.detachNow()]);
+    assert.equal(bridge.of("detach").length, 1);
+    s.release();
+    await s.run;
+  });
+
+  it("detachNow does nothing before the runner attached, without detachOnStop, or after it left", async () => {
+    // Before attach.
+    let early: (() => Promise<void>) | null = null;
+    bridge.attachReplies.push({ ...(bridge.defaultAttach() as { status: number; body: unknown }), delayMs: 300 });
+    const run = runBridgeSession(options({ detachOnStop: true, exposeDetach: (d) => (early = d) }));
+    await early!();
+    await run;
+    // Without detachOnStop.
+    bridge.callReplies.push(call(1));
+    const ci = held({ detachOnStop: undefined });
+    await ci.handling;
+    await ci.detachNow();
+    ci.release();
+    await ci.run;
+    // After a 410, an expiry, lost contact and a refusal.
+    const after = async (o: Partial<BridgeSessionOptions>) => {
+      let d: (() => Promise<void>) | null = null;
+      await runBridgeSession(options({ detachOnStop: true, exposeDetach: (x) => (d = x), ...o })).catch(() => {});
+      await d!();
+    };
+    bridge.callReplies.push({ status: 410, body: { error: "session_over" } });
+    await after({});
+    bridge.attachReplies.push({ status: 200, body: { sessionId: SESSION_ID, kind: "discover", expiresAt: "2000-01-01T00:00:00Z" } });
+    await after({});
+    bridge.callReplies.push(...Array.from({ length: 8 }, () => "drop" as const));
+    await after({});
+    bridge.callReplies.push({ status: 401, body: { error: "invalid_token" } });
+    await after({});
+    assert.equal(bridge.of("detach").length, 0);
+  });
+});
