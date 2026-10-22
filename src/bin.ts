@@ -3,8 +3,11 @@
  * The `peeps-bridge` command.
  *
  * Ctrl-C stops polling and lets the call in hand finish, so Peeps gets its
- * answer. A second Ctrl-C, or `STOP_DEADLINE_MS` after the first, closes the
- * browser and exits at once even if that call is stuck. If the event loop
+ * answer, then tells Peeps the runner is leaving (`detachOnStop`, bounded by
+ * its own short deadline) before the browser closes. A second Ctrl-C, or
+ * `STOP_DEADLINE_MS` after the first, closes the browser and exits at once
+ * even if that call is stuck, telling Peeps alongside the close (best effort,
+ * within `CLOSE_GRACE_MS`, and never a second time). If the event loop
  * itself is blocked, so that no handler can run, the watchdog thread kills
  * the process (`watchdog.ts`). SIGTERM and SIGHUP stop it as Ctrl-C does.
  */
@@ -23,6 +26,8 @@ const STALL_MS = 30_000;
 const watchdog = startEventLoopWatchdog({ stallMs: STALL_MS });
 const stop = new AbortController();
 let host: BrowserHost | null = null;
+/** The session's once-only detach, from the moment the session starts. */
+let detachNow: (() => Promise<void>) | null = null;
 /** Known from the moment it exists, so a stop during startup removes it too. */
 const scratch: string[] = [];
 let forcing = false;
@@ -37,7 +42,10 @@ const force = async () => {
   } catch {
     // Nobody left to tell.
   }
-  await Promise.race([host?.close(), new Promise((resolve) => setTimeout(resolve, CLOSE_GRACE_MS))]);
+  // Tell Peeps alongside the close: a no-op if a detach was already sent (the
+  // in-flight one is awaited instead), if the session is over, or before it
+  // attached.
+  await Promise.race([Promise.all([host?.close(), detachNow?.()]), new Promise((resolve) => setTimeout(resolve, CLOSE_GRACE_MS))]);
   // Whatever close() did not get to. Chromium first (it may still be
   // starting): alive, it would recreate its profile after the removal.
   killDescendants(process.pid, execFileSync as never, (line) => {
@@ -86,6 +94,9 @@ const code = await main(
     },
     onHost: (h) => {
       host = h;
+    },
+    onDetach: (d) => {
+      detachNow = d;
     },
   },
 );

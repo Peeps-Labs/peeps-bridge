@@ -229,8 +229,15 @@ describe("main, serving a session", () => {
   it("answers a call that hangs past the deadline, then closes the browser and exits 1", async () => {
     bridge.callReplies.push(call(1, "browser_navigate", { url: `${sites.appUrl}/spin` }), call(2, "browser_wait_for", { time: 1 }), call(3, "browser_tabs", { action: "list" }), call(4, "browser_snapshot", {}));
     const t = io();
+    let scratchAtDetach: string[] = [];
+    bridge.onRequest = (r) => {
+      if (r.path.endsWith("/detach")) scratchAtDetach = fs.readdirSync(tmp);
+    };
     const code = await main(command(), { PEEPS_RUNNER_GRANT: GRANT, E2E_SHOP_PASSWORD: "x" }, t.io, { tmpRoot: tmp, callDeadlineMs: 3000 });
     assert.equal(code, 1);
+    // Peeps is told, before the browser's scratch directory goes.
+    assert.equal(bridge.of("detach").length, 1);
+    assert.ok(scratchAtDetach.some((d) => d.startsWith("peeps-bridge-")), JSON.stringify(scratchAtDetach));
     const results = bridge.of("result").map((r) => JSON.stringify(r.body));
     // The page's loop stalls the first call that reads it (a snapshot or the
     // tab list): that call is answered at the deadline, and it is the last.
@@ -240,6 +247,83 @@ describe("main, serving a session", () => {
     assert.ok(bridge.of("calls").length <= stuckAt + 1);
     assert.match(t.out.join("\n"), /the browser stopped responding/);
     assert.deepEqual(fs.readdirSync(tmp), []);
+  });
+
+  it("on a stop, answers the call in hand, then tells Peeps once, then closes the browser", async () => {
+    bridge.callReplies.push(call(1, "browser_wait_for", { time: 1 }), ...Array.from({ length: 5 }, () => ({ status: 204, delayMs: 500 })));
+    const stop = new AbortController();
+    let scratchAtDetach: string[] = [];
+    bridge.onRequest = (r) => {
+      // Stop while call 1 is running in the browser.
+      if (r.path.includes("/calls?") && bridge.of("calls").length === 1) setTimeout(() => stop.abort(), 300);
+      if (r.path.endsWith("/detach")) scratchAtDetach = fs.readdirSync(tmp);
+    };
+    const t = io();
+    const code = await main(command(), { PEEPS_RUNNER_GRANT: GRANT, E2E_SHOP_PASSWORD: "x" }, t.io, { tmpRoot: tmp, signal: stop.signal });
+    assert.equal(code, 0, t.out.join("\n") + t.err.join("\n"));
+    assert.deepEqual(
+      bridge.requests.map((r) => r.path.split("/").pop()),
+      ["attach", "calls?wait=25", "result", "detach"],
+    );
+    const [detach] = bridge.of("detach");
+    assert.equal(detach!.headers.authorization, GRANT);
+    assert.equal(detach!.headers["x-peeps-runner-instance"], bridge.of("calls")[0]!.headers["x-peeps-runner-instance"]);
+    // The browser's scratch directory was still there: it closes after.
+    assert.ok(scratchAtDetach.some((d) => d.startsWith("peeps-bridge-")), JSON.stringify(scratchAtDetach));
+    assert.deepEqual(fs.readdirSync(tmp), []);
+    assert.match(t.out.join("\n"), /Peeps ended the session\n.*stopped after 1 call/);
+  });
+
+  it("hands out detachNow, which tells Peeps once while a call is still in hand (the forced stop's path)", async () => {
+    bridge.callReplies.push(call(1, "browser_wait_for", { time: 2 }), ...Array.from({ length: 5 }, () => ({ status: 204, delayMs: 500 })));
+    const stop = new AbortController();
+    let detachNow: (() => Promise<void>) | null = null;
+    let resultsAtDetach = -1;
+    bridge.onRequest = (r) => {
+      if (r.path.endsWith("/detach")) resultsAtDetach = bridge.of("result").length;
+      if (r.path.includes("/calls?") && bridge.of("calls").length === 1) {
+        setTimeout(() => {
+          stop.abort();
+          void detachNow!();
+        }, 300);
+      }
+    };
+    const t = io();
+    const code = await main(command(), { PEEPS_RUNNER_GRANT: GRANT, E2E_SHOP_PASSWORD: "x" }, t.io, {
+      tmpRoot: tmp,
+      signal: stop.signal,
+      onDetach: (d) => (detachNow = d),
+    });
+    assert.equal(code, 0);
+    assert.equal(resultsAtDetach, 0, "sent before the call in hand was answered");
+    // The stop that followed sent no second one.
+    assert.equal(bridge.of("detach").length, 1);
+    assert.equal(bridge.of("result").length, 1);
+  });
+
+  it("exits 0 and prints one line without the grant when the detach fails", async () => {
+    bridge.callReplies.push(...Array.from({ length: 5 }, () => ({ status: 204, delayMs: 500 })));
+    bridge.detachReplies.push("drop");
+    const stop = new AbortController();
+    bridge.onRequest = (r) => {
+      if (r.path.includes("/calls?")) setTimeout(() => stop.abort(), 100);
+    };
+    const t = io();
+    const code = await main(command(), { PEEPS_RUNNER_GRANT: GRANT, E2E_SHOP_PASSWORD: "x" }, t.io, { tmpRoot: tmp, signal: stop.signal });
+    assert.equal(code, 0);
+    assert.equal(bridge.of("detach").length, 1);
+    const all = t.out.join("\n") + t.err.join("\n");
+    assert.equal(t.out.filter((l) => /could not end the session/.test(l)).length, 1, all);
+    assert.doesNotMatch(all, /c2lnbmF0dXJl/);
+  });
+
+  it("sends no detach when Peeps ends the session or contact is lost", async () => {
+    bridge.callReplies.push(call(1, "browser_snapshot", {}));
+    const t = io();
+    assert.equal(await main(command(), { PEEPS_RUNNER_GRANT: GRANT, E2E_SHOP_PASSWORD: "x" }, t.io, { tmpRoot: tmp }), 0);
+    bridge.callReplies.push(...Array.from({ length: 8 }, () => "drop" as const));
+    assert.equal(await main(command(), { PEEPS_RUNNER_GRANT: GRANT, E2E_SHOP_PASSWORD: "x" }, t.io, { tmpRoot: tmp, sleep: async () => {} }), 1);
+    assert.equal(bridge.of("detach").length, 0);
   });
 
   it("exits 1 with the next step when Peeps refuses the runner", async () => {
@@ -288,6 +372,12 @@ describe("the peeps-bridge process", () => {
       const code = await exited;
       assert.equal(code, 0, output);
       assert.match(output, /stopped/);
+      // Peeps is told once, as the poll identifies itself.
+      const detaches = bridge.of("detach");
+      assert.equal(detaches.length, 1, output);
+      assert.equal(detaches[0]!.headers.authorization, GRANT);
+      assert.equal(detaches[0]!.headers["x-peeps-runner-instance"], bridge.of("calls")[0]!.headers["x-peeps-runner-instance"]);
+      assert.match(output, /Peeps ended the session/);
       assert.deepEqual(
         fs.readdirSync(tmp).filter((d) => d.startsWith("peeps-bridge-")),
         [],
@@ -325,6 +415,7 @@ describe("the peeps-bridge process", () => {
       assert.ok(Date.now() - started < 6000, `took ${Date.now() - started} ms`);
       assert.equal(code, 130, output);
       assert.match(output, /closing the browser now/);
+      assert.ok(bridge.of("detach").length <= 1, output);
       assert.deepEqual(
         fs.readdirSync(tmp).filter((d) => d.startsWith("peeps-bridge-") || d.startsWith("playwright_chromiumdev_profile-")),
         [],
@@ -356,6 +447,7 @@ describe("the peeps-bridge process", () => {
     await new Promise((r) => setTimeout(r, 500));
     return {
       child,
+      bridge,
       exited,
       output: () => output,
       leftovers: () => fs.readdirSync(tmp).filter((d) => d.startsWith("peeps-bridge-") || d.startsWith("playwright_chromiumdev_profile-")),
@@ -378,6 +470,43 @@ describe("the peeps-bridge process", () => {
       const took = Date.now() - started;
       assert.ok(took >= 9_000 && took < 16_000, `took ${took} ms`);
       assert.equal(code, 130, p.output());
+      // The forced stop still tells Peeps, once, with the call outstanding.
+      assert.equal(p.bridge.of("detach").length, 1, p.output());
+      assert.deepEqual(p.leftovers(), []);
+    } finally {
+      await p.cleanup();
+    }
+  });
+
+  it("tells Peeps once on SIGTERM too", async () => {
+    const p = await startProcess([call(1, "browser_snapshot", {}), ...Array.from({ length: 20 }, () => ({ status: 204, delayMs: 1000 }))]);
+    try {
+      p.child.kill("SIGTERM");
+      const { code } = await p.exited;
+      assert.equal(code, 0, p.output());
+      assert.equal(p.bridge.of("detach").length, 1, p.output());
+      assert.deepEqual(p.leftovers(), []);
+    } finally {
+      await p.cleanup();
+    }
+  });
+
+  it("stops at once on a second Ctrl-C while the detach is waiting for Peeps", async () => {
+    const p = await startProcess([call(1, "browser_snapshot", {}), ...Array.from({ length: 20 }, () => ({ status: 204, delayMs: 1000 }))]);
+    p.bridge.detachReplies.push({ status: 200, body: { status: "ended" }, delayMs: 20_000 });
+    try {
+      p.child.kill("SIGINT");
+      const deadline = Date.now() + 10_000;
+      while (p.bridge.of("detach").length === 0 && Date.now() < deadline) await new Promise((r) => setTimeout(r, 20));
+      assert.equal(p.bridge.of("detach").length, 1, p.output());
+      const started = Date.now();
+      p.child.kill("SIGINT");
+      const { code } = await p.exited;
+      const took = Date.now() - started;
+      assert.equal(code, 130, p.output());
+      assert.match(p.output(), /closing the browser now/);
+      assert.ok(took < 6_000, `took ${took} ms`);
+      assert.equal(p.bridge.of("detach").length, 1, p.output());
       assert.deepEqual(p.leftovers(), []);
     } finally {
       await p.cleanup();

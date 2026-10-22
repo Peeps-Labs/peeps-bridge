@@ -14,6 +14,18 @@
  *   the backoff below stays far inside that.
  * - `POST …/calls/<id>/result` `{ ok: true, result }` or `{ ok: false, error }`.
  *   It is also a heartbeat, and answers 410 once the session is over.
+ * - `POST …/detach` (no body): a local runner that stops (Ctrl-C) says so, so
+ *   Peeps ends the session at once instead of waiting out the heartbeat.
+ *   200 `{ sessionId, status }`, `status` being `ended` or `already_over`; it
+ *   is idempotent, and ends the session even with a call outstanding. Peeps
+ *   refuses it for CI (403 `local_runner_only`). Sent at most once, only with
+ *   `detachOnStop`, only to a session this runner attached to: on a stop,
+ *   after the call in hand is answered, or earlier through `exposeDetach`
+ *   for a forced exit. One short deadline covers it, no retry: a failure is
+ *   one log line and the runner leaves anyway. Never after the runner itself
+ *   left for a 410, expiry, lost contact or a refusal: the session is already
+ *   over, or this runner may not speak for it. (A stop after `expiresAt`
+ *   passed but before the runner noticed does detach; that is harmless.)
  * - 401 `invalid_token` (any failed grant or authority check), 409
  *   `other_runner` / `other_job` / `playwright_mcp_version`, 404 `not_found`.
  */
@@ -57,6 +69,21 @@ export interface BridgeSessionOptions {
    * runner. Comfortably above the 25-second long poll.
    */
   requestTimeoutMs?: number;
+  /**
+   * Tell Peeps when the signal stops the runner (`POST …/detach`), so the
+   * session ends at once. A local runner's; Peeps refuses it for CI.
+   */
+  detachOnStop?: boolean;
+  /** How long the whole detach may take; short, so it never holds up exit. */
+  detachTimeoutMs?: number;
+  /**
+   * Hands the caller `detachNow`, the same once-only detach a stop sends, for
+   * a forced exit that cannot wait for the loop (a call in hand that will not
+   * finish). It does nothing unless `detachOnStop` is set, before the runner
+   * attached, after it left (410, expiry, lost contact, a refusal) or once a
+   * detach was sent; it never rejects.
+   */
+  exposeDetach?: (detachNow: () => Promise<void>) => void;
 }
 
 export type SessionEndReason =
@@ -91,6 +118,11 @@ export const MAX_TRANSPORT_ERRORS = 8;
 /** The result route's own limit on `error`. */
 const MAX_ERROR_CHARS = 4000;
 const RESULT_ATTEMPTS = 3;
+/**
+ * The most the whole detach may take, authorization included: no longer than
+ * the bin's 3-second close grace, so a forced exit never waits on it longer.
+ */
+const DETACH_TIMEOUT_MS = 3_000;
 
 class SessionOver extends Error {}
 class Stopped extends Error {}
@@ -124,6 +156,22 @@ export async function runBridgeSession(options: BridgeSessionOptions): Promise<S
   const requestTimeoutMs = options.requestTimeoutMs ?? 60_000;
   let handled = 0;
   let transportErrors = 0;
+  let attachedOnce = false;
+  /** The session ended without a stop (410, expiry, lost contact, refusal). */
+  let left = false;
+  let detaching: Promise<void> | null = null;
+  /**
+   * Tell Peeps the runner is leaving: at most once per session, only with
+   * `detachOnStop`, only once attached and not after the runner left for any
+   * reason but a stop. A second caller gets the first one's promise. Never
+   * rejects.
+   */
+  const detachNow = (): Promise<void> => {
+    if (!options.detachOnStop || !attachedOnce || left) return Promise.resolve();
+    detaching ??= detach();
+    return detaching;
+  };
+  options.exposeDetach?.(detachNow);
 
   /**
    * One request. Answers the response, or null for a transport error (no
@@ -183,73 +231,132 @@ export async function runBridgeSession(options: BridgeSessionOptions): Promise<S
     throw refusalError(answer);
   };
 
-  try {
-    if (signal?.aborted) throw new Stopped();
-
-    // Attach.
-    let attached: { kind?: string; expiresAt?: string } | null = null;
-    while (!attached) {
-      const answer = await request("POST", `${sessionPath}/attach`, { tools: options.tools, runnerInfo: options.runnerInfo }, true);
-      if (!answer) {
-        if (!(await transportError("attach"))) return { reason: "lost_contact", handled };
-        continue;
-      }
-      if (answer.status !== 200) refusal(answer);
-      attached = (answer.body ?? {}) as { kind?: string; expiresAt?: string };
-    }
-    transportErrors = 0;
-    const expiresAt = attached.expiresAt ? Date.parse(attached.expiresAt) : Number.POSITIVE_INFINITY;
-    log(`attached to session ${options.sessionId} (${attached.kind ?? "unknown kind"}); it expires at ${attached.expiresAt ?? "an unknown time"}`);
-
-    for (;;) {
+  /** Serve until the session ends or the signal stops it. */
+  const serve = async (): Promise<SessionEnd> => {
+    try {
       if (signal?.aborted) throw new Stopped();
-      if (now() >= expiresAt) {
-        log("the session's time is up; leaving");
-        return { reason: "expired", handled };
-      }
-      options.onPoll?.();
-      const answer = await request("GET", `${sessionPath}/calls?wait=${LONG_POLL_SECONDS}`, undefined, true);
-      if (!answer) {
-        if (!(await transportError("poll"))) return { reason: "lost_contact", handled };
-        continue;
+
+      // Attach.
+      let attached: { kind?: string; expiresAt?: string } | null = null;
+      while (!attached) {
+        const answer = await request("POST", `${sessionPath}/attach`, { tools: options.tools, runnerInfo: options.runnerInfo }, true);
+        if (!answer) {
+          if (!(await transportError("attach"))) return { reason: "lost_contact", handled };
+          continue;
+        }
+        if (answer.status !== 200) refusal(answer);
+        attached = (answer.body ?? {}) as { kind?: string; expiresAt?: string };
       }
       transportErrors = 0;
-      if (answer.status === 204) continue;
-      if (answer.status !== 200) refusal(answer);
-      const call = (answer.body as { call?: BridgeCall } | null)?.call;
-      if (!call) continue;
+      attachedOnce = true;
+      const expiresAt = attached.expiresAt ? Date.parse(attached.expiresAt) : Number.POSITIVE_INFINITY;
+      log(`attached to session ${options.sessionId} (${attached.kind ?? "unknown kind"}); it expires at ${attached.expiresAt ?? "an unknown time"}`);
 
-      let outcome: CallOutcome;
-      try {
-        outcome = await options.handle(call);
-      } catch (error) {
-        outcome = { ok: false, error: error instanceof Error ? error.message : String(error) };
-      }
-      if (!outcome.ok) outcome = { ok: false, error: outcome.error.slice(0, MAX_ERROR_CHARS) };
-      handled += 1;
+      for (;;) {
+        if (signal?.aborted) throw new Stopped();
+        if (now() >= expiresAt) {
+          log("the session's time is up; leaving");
+          return { reason: "expired", handled };
+        }
+        options.onPoll?.();
+        const answer = await request("GET", `${sessionPath}/calls?wait=${LONG_POLL_SECONDS}`, undefined, true);
+        if (!answer) {
+          if (!(await transportError("poll"))) return { reason: "lost_contact", handled };
+          continue;
+        }
+        transportErrors = 0;
+        if (answer.status === 204) continue;
+        if (answer.status !== 200) refusal(answer);
+        const call = (answer.body as { call?: BridgeCall } | null)?.call;
+        if (!call) continue;
 
-      // Not abortable: a call in hand is answered even while stopping.
-      for (let attempt = 1; ; attempt++) {
-        const posted = await request("POST", `${sessionPath}/calls/${encodeURIComponent(call.id)}/result`, outcome, false);
-        if (posted) {
-          if (posted.status !== 200) refusal(posted);
-          break;
+        let outcome: CallOutcome;
+        try {
+          outcome = await options.handle(call);
+        } catch (error) {
+          outcome = { ok: false, error: error instanceof Error ? error.message : String(error) };
         }
-        if (attempt >= RESULT_ATTEMPTS) {
-          log(`could not deliver the result of #${call.seq} after ${attempt} attempts`);
-          break;
+        if (!outcome.ok) outcome = { ok: false, error: outcome.error.slice(0, MAX_ERROR_CHARS) };
+        handled += 1;
+
+        // Not abortable: a call in hand is answered even while stopping.
+        for (let attempt = 1; ; attempt++) {
+          const posted = await request("POST", `${sessionPath}/calls/${encodeURIComponent(call.id)}/result`, outcome, false);
+          if (posted) {
+            if (posted.status !== 200) refusal(posted);
+            break;
+          }
+          if (attempt >= RESULT_ATTEMPTS) {
+            log(`could not deliver the result of #${call.seq} after ${attempt} attempts`);
+            break;
+          }
+          await sleep(backoffMs(attempt));
         }
-        await sleep(backoffMs(attempt));
       }
+    } catch (error) {
+      if (error instanceof SessionOver) {
+        log(`Peeps ended the session after ${handled} call(s)`);
+        return { reason: "session_over", handled };
+      }
+      if (error instanceof Stopped) return { reason: "stopped", handled };
+      throw error;
     }
+  };
+
+  let end: SessionEnd;
+  try {
+    end = await serve();
   } catch (error) {
-    if (error instanceof SessionOver) {
-      log(`Peeps ended the session after ${handled} call(s)`);
-      return { reason: "session_over", handled };
-    }
-    if (error instanceof Stopped) return { reason: "stopped", handled };
+    left = true;
     throw error;
   }
+  if (end.reason === "stopped") await detachNow();
+  else left = true;
+  return end;
+
+  /**
+   * Once, on a stop: tell Peeps, and leave whatever it answers. Not
+   * abortable by the stop signal (it is the stop), not retried, and never
+   * followed to a redirect (it carries the grant).
+   */
+  async function detach(): Promise<void> {
+    const timeoutMs = options.detachTimeoutMs ?? DETACH_TIMEOUT_MS;
+    const cannot = (why: string) => log(`could not end the session at Peeps (${why}); leaving anyway`);
+    // One deadline for all of it, the authorization lookup included (a CI
+    // provider's token fetch could stall).
+    const deadline = AbortSignal.timeout(timeoutMs);
+    const timedOut = new Promise<never>((_, reject) => deadline.addEventListener("abort", () => reject(deadline.reason as Error), { once: true }));
+    timedOut.catch(() => {});
+    let status: number;
+    let body: unknown = null;
+    try {
+      const authorization = await Promise.race([Promise.resolve(options.authorization()), timedOut]);
+      const response = await fetch(`${base}${sessionPath}/detach`, {
+        method: "POST",
+        headers: { ...options.headers, authorization },
+        redirect: "manual",
+        signal: deadline,
+      });
+      status = response.status;
+      try {
+        body = JSON.parse(await response.text());
+      } catch {
+        body = null;
+      }
+    } catch {
+      cannot(deadline.aborted ? `no answer within ${timeoutMs / 1000} s` : "no answer");
+      return;
+    }
+    const answer = (body ?? {}) as { status?: unknown; error?: unknown };
+    if (status === 200) {
+      log(answer.status === "ended" ? "Peeps ended the session" : answer.status === "already_over" ? "the session was already over at Peeps" : "Peeps answered the detach");
+      return;
+    }
+    // The code comes from the server: printed only if it looks like one.
+    const code = typeof answer.error === "string" && /^[a-z0-9_]{1,64}$/.test(answer.error) ? answer.error : `http_${status}`;
+    cannot(`${status} ${code}`);
+  }
+
 }
 
 function refusalError(answer: Answer): BridgeRefusedError {
