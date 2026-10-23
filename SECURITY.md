@@ -18,7 +18,7 @@ the Security tab. Do not open a public issue for a security problem.
 The runner authenticates with a **grant** that Peeps' `start_local_discovery`
 returns once, for one session. It is signed by Peeps over that session, the
 project, the person who started it and the MCP client they used, and it
-expires when the session does (at most 45 minutes).
+expires when the session does (at most 40 minutes).
 
 Consequences worth knowing:
 

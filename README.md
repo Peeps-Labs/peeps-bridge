@@ -113,7 +113,7 @@ In plain words:
   through a page that shows part of a field, or a changed form of it (see
   SECURITY.md). **Use a test account, never real credentials.**
 - **Short-lived.** The grant works for one session, one person and one MCP
-  connection, and only while the session lasts (at most 45 minutes). Peeps
+  connection, and only while the session lasts (at most 40 minutes). Peeps
   checks it on every request, so revoking the MCP connection, losing your
   role, or Peeps ending the session stops the runner within one poll.
 
