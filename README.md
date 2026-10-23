@@ -15,7 +15,7 @@ the grant for one session, and runs it.
 ## The command
 
 ```sh
-PEEPS_RUNNER_GRANT=<grant> npx -y @peepsai/bridge@0.1.1 \
+PEEPS_RUNNER_GRANT=<grant> npx -y @peepsai/bridge@0.1.2 \
   --server https://app.peepsai.com \
   --session <session id> \
   --target-url http://localhost:3000 \
@@ -35,7 +35,7 @@ PEEPS_RUNNER_GRANT=<grant> npx -y @peepsai/bridge@0.1.1 \
 While it runs you see one line per action:
 
 ```
-[peeps] peeps-bridge 0.1.1: serving session 6f1c… for https://app.peepsai.com
+[peeps] peeps-bridge 0.1.2: serving session 6f1c… for https://app.peepsai.com
 [peeps] the browser may reach: http://localhost:3000
 [peeps] attached to session 6f1c… (discover); it expires at 2026-10-20T15:45:00.000Z
 [peeps] #1 navigate to http://localhost:3000/ on /
@@ -46,6 +46,8 @@ While it runs you see one line per action:
 Check the `the browser may reach:` line: those origins, and nothing else, are
 what the browser can open.
 
+### Stopping the runner
+
 Press Ctrl-C to stop. The action in progress finishes (for at most 10
 seconds), the runner tells Peeps it is leaving so the session ends at once
 (waiting at most 3 seconds for an answer), the browser closes and the runner
@@ -55,6 +57,22 @@ seconds, or you press Ctrl-C twice, the runner still tries to tell Peeps
 while it closes the browser, but gives up after 3 seconds; if Peeps is not
 told (no network, say), it presumes the runner gone once it has been silent
 for 3 minutes.
+
+Stopping the process that started the runner stops it the same way, even if
+only that process is stopped: a coding agent that ends its background `npx`
+job, by killing just the npx process, makes the runner begin stopping within
+about a second (it prints `the process that started the runner exited;
+stopping`), and a runner whose npx is already gone when it starts exits
+before attaching. npm does pass SIGINT and SIGTERM on to the command it
+runs, but on Linux that is a `sh -c`, which neither passes them on nor exits,
+and a killed npx (SIGKILL) passes nothing on at all; so the runner watches
+for npx going away. There is no need for shell job control (`set -m`,
+killing a process group) to stop it. Where the runner is npx's own child
+(macOS), one Ctrl-C reaches it twice, from the terminal and from npm; it
+counts as one, so the action in progress still finishes. It follows from this that a runner started directly from a shell
+(`node dist/bin.js`) stops when that shell exits. Nothing above npx is
+watched: npx outliving the shell that ran it leaves the runner going. On
+Windows, which does not re-parent processes, stop it with Ctrl-C.
 
 ## What it can and cannot do
 

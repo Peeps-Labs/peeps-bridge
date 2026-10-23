@@ -9,15 +9,40 @@
  * even if that call is stuck, telling Peeps alongside the close (best effort,
  * within `CLOSE_GRACE_MS`, and never a second time). If the event loop
  * itself is blocked, so that no handler can run, the watchdog thread kills
- * the process (`watchdog.ts`). SIGTERM and SIGHUP stop it as Ctrl-C does.
+ * the process (`watchdog.ts`). SIGTERM and SIGHUP stop it as Ctrl-C does,
+ * and so does the process that started it exiting (`parent-watch.ts`). npm
+ * forwards SIGINT and SIGTERM to its child, but on Linux that is its `sh -c`
+ * (dash), which swallows them and outlives npx, and a SIGKILL of npx reaches
+ * nobody: an agent that kills npx would otherwise leave the runner polling
+ * with a live browser. Where the shell execs the runner (macOS), npm's
+ * forwarded copy of a Ctrl-C is not taken for a second one
+ * (`stop-control.ts`).
  */
 
+// Only light imports here: the parents are recorded before the runner loads
+// anything heavy (`cli.js`, Playwright, which take a moment, longer on a cold
+// npx), so that a launcher dying meanwhile is seen as a change. A static
+// import would not do: ESM loads the whole static graph before running any.
 import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 
 import type { BrowserHost } from "./browser/browser-host.js";
-import { main } from "./cli.js";
+import { launcherGone, readName, readPpid, startParentWatch, watchedChain } from "./parent-watch.js";
+import { stopControl } from "./stop-control.js";
 import { killDescendants, startEventLoopWatchdog } from "./watchdog.js";
+
+const snapshot = { pid: process.pid, ppid: process.ppid, env: process.env, readPpid, readName };
+const chain = watchedChain(snapshot);
+// npx already gone before the runner looked: there is nothing to serve for.
+if (launcherGone(snapshot)) {
+  // The launcher's pipe may have gone with it (EPIPE): exit all the same.
+  try {
+    fs.writeSync(1, "[peeps] the process that started the runner exited; stopping\n");
+  } catch {
+    // Nobody left to tell.
+  }
+  process.exit(0);
+}
 
 const STOP_DEADLINE_MS = 10_000;
 const CLOSE_GRACE_MS = 3_000;
@@ -65,15 +90,23 @@ const force = async () => {
   process.exit(130);
 };
 
-const onSignal = () => {
-  if (stop.signal.aborted) {
-    void force();
-    return;
-  }
-  process.stdout.write("\n[peeps] stopping after the current action (Ctrl-C again to stop at once)\n");
-  stop.abort();
-  setTimeout(() => void force(), STOP_DEADLINE_MS).unref();
-};
+/**
+ * The orderly stop: the call in hand is answered, Peeps is told, the browser
+ * closes. Only a second signal forces it (`stop-control.ts`).
+ */
+const control = stopControl({
+  begin: (reason) => {
+    parentWatch.stop();
+    process.stdout.write(
+      reason === "signal" ? "\n[peeps] stopping after the current action (Ctrl-C again to stop at once)\n" : "[peeps] the process that started the runner exited; stopping\n",
+    );
+    stop.abort();
+    setTimeout(() => void force(), STOP_DEADLINE_MS).unref();
+  },
+  force: () => void force(),
+});
+const onSignal = () => control.signal();
+const parentWatch = startParentWatch({ chain, readPpid, onGone: () => control.parentGone() });
 process.on("SIGINT", onSignal);
 process.on("SIGTERM", onSignal);
 // The terminal closing: the same orderly stop (Playwright's handler is off).
@@ -82,6 +115,13 @@ process.on("SIGHUP", onSignal);
 process.stdout.on("error", () => {});
 process.stderr.on("error", () => {});
 
+const { main } = await import("./cli.js");
+// Stopped while it was loading: leave before any browser is started.
+if (stop.signal.aborted && !forcing) {
+  watchdog.stop();
+  parentWatch.stop();
+  process.exit(0);
+}
 const code = await main(
   process.argv.slice(2),
   process.env,
@@ -101,4 +141,5 @@ const code = await main(
   },
 );
 watchdog.stop();
+parentWatch.stop();
 process.exit(forcing ? 130 : code);

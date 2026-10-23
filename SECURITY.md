@@ -213,7 +213,15 @@ sequences (OSC 52 writes your clipboard).
 Ctrl-C lets the action in hand finish, for at most 10 seconds, tells Peeps
 the runner is leaving, then closes the browser; a second Ctrl-C closes it at
 once, even while the browser is still starting. SIGTERM and SIGHUP stop it
-the same way.
+the same way, and so does the process that started the runner exiting (npx,
+or the shell that ran it). npm forwards SIGINT and SIGTERM to the command
+it runs, but on Linux that is a `sh -c` that swallows them and outlives
+npx, and a SIGKILL of npx reaches nobody; so the runner checks about once a
+second whether its parent, and npx above the `sh -c` npm runs it through,
+is still the process that started it, and a runner whose npx is already
+gone when it starts exits before attaching. A runner orphaned that
+way does not keep a browser open on your machine. (Not on Windows, which
+does not re-parent processes.)
 
 Telling Peeps is one `POST …/detach` carrying the grant in its
 `Authorization` header, following no redirect and not retried, with at most

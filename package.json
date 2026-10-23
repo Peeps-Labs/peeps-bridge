@@ -1,6 +1,6 @@
 {
   "name": "@peepsai/bridge",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "Runs a Peeps agent's browser tools on your machine, so Peeps can explore the app you are building at localhost.",
   "license": "MIT",
   "author": "Peeps Labs",

@@ -24,7 +24,8 @@ while time.time() < deadline and marker not in out:
 started = time.time()
 if ctrl_c:
     os.write(fd, b"\x03")
-    time.sleep(0.05)
+    # Past the runner's window for a duplicate of the same Ctrl-C.
+    time.sleep(0.7)
     os.write(fd, b"\x03")
     # Keep draining so the child never blocks on a full terminal.
     while True:

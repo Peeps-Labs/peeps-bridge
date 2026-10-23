@@ -198,6 +198,10 @@ export async function main(argv: string[], env: NodeJS.ProcessEnv, rawIo: Io, de
     return 2;
   }
 
+  // Stopped before it started (the launcher went while it was loading):
+  // nothing to check, no browser to start.
+  if (deps.signal?.aborted) return 0;
+
   const preflight = (deps.preflight ?? chromiumPreflight)();
   if (!preflight.ok) {
     io.err(preflight.message);
