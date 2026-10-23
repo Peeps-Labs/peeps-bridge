@@ -1,5 +1,43 @@
 # Changelog
 
+## 0.1.2 (2026-10-23)
+
+- The runner stops when the process that started it exits (PQA-2551). A
+  coding agent that ended its background job by killing the npx process
+  left the runner polling with a live browser: npm forwards SIGINT and
+  SIGTERM to the command it runs, but on Linux that is its `sh -c` (dash),
+  which swallows them and outlives npx, and a SIGKILL of npx reaches
+  nobody. The runner now checks about once a second (on an unref'd
+  timer) whether its parent is still the one it started with, and, when npm
+  started it through a `sh -c` that does not exec it (dash, Linux's usual
+  `/bin/sh`, which outlives a killed npx), whether that shell's parent is
+  still npx. When one has gone, it prints `the process that started the
+  runner exited; stopping` and stops as on SIGTERM: the call in hand is
+  answered, the one best-effort detach is sent (0.1.1's rules), the browser
+  closes and the runner exits. A stop already under way is left alone. A
+  runner started directly from a shell stops when that shell exits; nothing
+  above npx is watched, so npx outliving the shell that ran it leaves the
+  runner going. Windows does not re-parent processes, so there the watch
+  never fires. No opt-out flag.
+- The parents are recorded before the runner loads anything heavy (it
+  imports the rest afterwards), so a launcher that dies while a cold npx is
+  still loading it is caught too; and a runner that, started by npx, finds
+  itself already under init or a subreaper (`systemd`, `launchd`, `tini` …)
+  exits before attaching. A direct start is never judged that way, since a
+  runner daemonised on purpose looks the same.
+- A failure to read `/proc` other than the process being gone (EMFILE, EIO,
+  EACCES) skips that check instead of stopping a healthy runner.
+- Only a second signal more than 500 ms after the first forces a stop. Where
+  /bin/sh execs the command (macOS, Fedora) the runner is npx's own child,
+  and one terminal Ctrl-C reaches it twice, from the terminal and forwarded
+  by npm; that, or the parent watch beginning the stop as the same Ctrl-C
+  arrives, is one orderly stop, not a forced one.
+- npx launch is recognised by npm's script being `peeps-bridge`
+  (`npm_lifecycle_script`), not by npm's variables alone, which a harness
+  that npx started passes on to anything it starts.
+- A stop that begins while the runner is still loading exits before the
+  Chromium check or any browser is started.
+
 ## 0.1.1 (2026-10-22)
 
 - Stopping the runner ends the session at Peeps at once (PQA-2427). On

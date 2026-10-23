@@ -157,6 +157,24 @@ describe("main, before the browser", () => {
     assert.match(t.err.join("\n"), /--allow-origin takes an origin/);
   });
 
+  it("exits 0 before the Chromium check or any browser when already stopped (a stop while it was loading)", async () => {
+    const t = io();
+    let preflights = 0;
+    const stopped = new AbortController();
+    stopped.abort();
+    const code = await main(args, { PEEPS_RUNNER_GRANT: GRANT }, t.io, {
+      preflight: () => {
+        preflights++;
+        return { ok: true };
+      },
+      signal: stopped.signal,
+      onScratch: () => assert.fail("no browser scratch directory"),
+    });
+    assert.equal(code, 0);
+    assert.equal(preflights, 0);
+    assert.doesNotMatch(t.out.join("\n"), /serving session/);
+  });
+
   it("exits 1 with the install command when Chromium is missing", async () => {
     const t = io();
     const code = await main(args, { PEEPS_RUNNER_GRANT: GRANT }, t.io, { preflight: () => ({ ok: false, message: "install it with npx -y playwright-core@1 install" }) });
@@ -409,7 +427,8 @@ describe("the peeps-bridge process", () => {
       const exited = new Promise<number | null>((resolve) => child.on("exit", (code) => resolve(code)));
       const started = Date.now();
       child.kill("SIGINT");
-      await new Promise((r) => setTimeout(r, 300));
+      // Past the window in which a second signal is npm's copy of the first.
+      await new Promise((r) => setTimeout(r, 700));
       child.kill("SIGINT");
       const code = await exited;
       assert.ok(Date.now() - started < 6000, `took ${Date.now() - started} ms`);
@@ -496,9 +515,12 @@ describe("the peeps-bridge process", () => {
     p.bridge.detachReplies.push({ status: 200, body: { status: "ended" }, delayMs: 20_000 });
     try {
       p.child.kill("SIGINT");
+      const first = Date.now();
       const deadline = Date.now() + 10_000;
       while (p.bridge.of("detach").length === 0 && Date.now() < deadline) await new Promise((r) => setTimeout(r, 20));
       assert.equal(p.bridge.of("detach").length, 1, p.output());
+      // Past the window in which a second signal is npm's copy of the first.
+      await new Promise((r) => setTimeout(r, Math.max(0, 700 - (Date.now() - first))));
       const started = Date.now();
       p.child.kill("SIGINT");
       const { code } = await p.exited;
@@ -584,7 +606,8 @@ describe("the peeps-bridge process", () => {
       while (!/#1 /.test(output) && Date.now() < deadline) await new Promise((r) => setTimeout(r, 100));
       const exited = new Promise((resolve) => child.on("exit", resolve));
       child.kill("SIGINT");
-      await new Promise((r) => setTimeout(r, 300));
+      // Past the window in which a second signal is npm's copy of the first.
+      await new Promise((r) => setTimeout(r, 700));
       child.kill("SIGINT");
       await exited;
       watcher.close();
